@@ -4,7 +4,7 @@ package rabbitmq_test
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"reflect"
 	"testing"

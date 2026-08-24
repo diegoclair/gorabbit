@@ -2,7 +2,7 @@ package rabbitmq
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"maps"
 	"time"
 	"uuid"
