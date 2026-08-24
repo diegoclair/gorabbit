@@ -21,7 +21,8 @@ const (
 
 // RegisterHandler routes every message of type T to handler, whatever exchange
 // owns T — consuming facts owned by other applications is the point. It binds
-// the consumer queue to that exchange, so it must be called before Start.
+// the consumer queue to that exchange — immediately when connected, on the next
+// connection otherwise — and must be called before Start.
 func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Context, c *Client[E], msgType T, handler gorabbit.Handler[T]) error {
 	if !c.setup.isConsumer {
 		return errors.New("gorabbit: client is not a consumer, use WithConsumer")
@@ -33,11 +34,6 @@ func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Contex
 	msgName := messageTypeName(msgType)
 	exchange, err := exchangeOf(msgType)
 	if err != nil {
-		return err
-	}
-
-	if err := c.bindQueueToExchange(ctx, exchange, msgName, c.setup.queueName, true); err != nil {
-		c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)
 		return err
 	}
 
@@ -53,7 +49,13 @@ func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Contex
 		return err
 	}
 
+	// Registered before binding: a connection landing in between re-binds every
+	// registered handler, so the bind is never lost.
+	c.handlersMu.Lock()
 	c.handlers[handlersMapKey(exchange, msgName)] = hi
+	c.handlersMu.Unlock()
+
+	c.bindHandler(ctx, hi)
 
 	return nil
 }
@@ -119,7 +121,7 @@ func (c *Client[E]) consume(ctx context.Context) {
 		default:
 			if !c.connected() {
 				c.setup.logger.Info(ctx, "gorabbit: consumer not connected, attempting to reconnect")
-				if err := c.connect(ctx); err != nil {
+				if err := c.reconnect(ctx); err != nil {
 					c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", "error", err)
 					time.Sleep(c.setup.reconnectDelay)
 				}
@@ -175,7 +177,9 @@ func (c *Client[E]) handlerFor(msg *amqp091.Delivery) (handlerInfo, bool) {
 		}
 	}
 
+	c.handlersMu.RLock()
 	info, ok := c.handlers[handlersMapKey(exchange, msg.RoutingKey)]
+	c.handlersMu.RUnlock()
 
 	return info, ok
 }
@@ -306,6 +310,20 @@ func (c *Client[E]) retryCount(ctx context.Context, msg *amqp091.Delivery) int {
 // unbindUnusedBindings removes bindings recorded by previous runs whose handler
 // no longer exists, so the queue stops receiving messages nothing handles.
 func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
+	// Start may run while disconnected; the cleanup waits for a live channel.
+	ticker := time.NewTicker(c.setup.reconnectDelay)
+	defer ticker.Stop()
+
+	for !c.connected() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-ticker.C:
+		}
+	}
+
 	ch, err := c.channel()
 	if err != nil {
 		return
@@ -333,7 +351,10 @@ func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 			continue
 		}
 
-		if _, ok := c.handlers[handlersMapKey(info.Exchange, info.RoutingKey)]; ok {
+		c.handlersMu.RLock()
+		_, registered := c.handlers[handlersMapKey(info.Exchange, info.RoutingKey)]
+		c.handlersMu.RUnlock()
+		if registered {
 			continue
 		}
 

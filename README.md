@@ -81,7 +81,7 @@ client, err := rabbitmq.NewSetup[orders.Exchange](amqpURL, "order-service").
     WithPrefetchCount(10).
     Connect(gorabbit.NewMemoryCache())
 if err != nil {
-    log.Fatal(err)
+    log.Fatal(err) // only an invalid setup: a broker outage is not an error
 }
 defer client.Close()
 
@@ -168,11 +168,24 @@ attempt is counted in the `x-retry-count` header; past the limit the message
 moves to `<queue>.dlq`. Without `WithRetry`, a failed message is dead-lettered
 right away.
 
-## Offline caching
+## Offline caching and reconnection
 
-If RabbitMQ is unreachable, `Publish` stores the message in the `Cache` and
-returns nil; cached messages are published — in order — on the next successful
-connection. Each registered handler is also recorded there, so on the next start
+A client is always usable; a broker outage is a state, not an error. `Connect`
+returns an error only for an invalid setup or a missing cache — when RabbitMQ is
+unreachable it returns a live client that starts disconnected, keeps
+reconnecting in background (`WithReconnectDelay` between attempts, each one
+bounded by `WithDialTimeout`) and heals itself on the first successful
+connection:
+
+- `Publish` stores the message in the `Cache` and returns nil; cached messages
+  are published — in order — on the next successful connection.
+- `RegisterHandler` and `Start` work while disconnected: the topology is
+  declared and the queue bindings are applied when the connection lands, and the
+  consumer starts consuming.
+- `Connected()` reports the current state — for health checks and metrics, never
+  a precondition for calling anything.
+
+Each registered handler is also recorded in the cache, so on the next start
 bindings whose handler no longer exists in the code are unbound.
 
 `gorabbit.NewMemoryCache()` is process-local and good enough for a single

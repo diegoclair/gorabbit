@@ -152,10 +152,47 @@ func TestConnectRequiresCache(t *testing.T) {
 	require.Nil(t, c)
 }
 
-func TestConnectFailsWithUnreachableBroker(t *testing.T) {
-	c, err := NewSetup[ordersExchange](unreachableURL, "app").WithDialTimeout(200 * time.Millisecond).Connect(gorabbit.NewMemoryCache())
-	require.Error(t, err)
+func TestConnectRejectsAnInvalidSetup(t *testing.T) {
+	c, err := NewSetup[ordersExchange]("", "app").Connect(gorabbit.NewMemoryCache())
+	require.ErrorContains(t, err, "amqp url is required")
 	require.Nil(t, c)
+}
+
+// A broker outage is a state, not an error: Connect hands back a live client
+// that caches publishes and holds handler registrations for the connection.
+func TestConnectWithUnreachableBrokerReturnsUsableClient(t *testing.T) {
+	ctx := context.Background()
+	cache := gorabbit.NewMemoryCache()
+
+	c, err := NewSetup[ordersExchange](unreachableURL, "app").
+		WithConsumer("app-queue").
+		WithDialTimeout(200 * time.Millisecond).
+		Connect(cache)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	t.Cleanup(c.Close)
+
+	require.False(t, c.Connected())
+
+	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "1"}))
+	keys, err := cache.GetAllKeys(ctx, cacheKey("app", 0)+"*")
+	require.NoError(t, err)
+	require.Len(t, keys, 1, "an offline publish must land in the cache")
+
+	require.NoError(t, RegisterHandler(ctx, c, orderCreated{},
+		func(context.Context, orderCreated) error { return nil }))
+
+	c.handlersMu.RLock()
+	_, registered := c.handlers[handlersMapKey("orders", "orderCreated")]
+	c.handlersMu.RUnlock()
+	require.True(t, registered, "an offline registration must wait for the connection")
+
+	info, err := cache.Get(ctx, c.handlerInfoCacheKey(handlerInfo{Exchange: "orders", RoutingKey: "orderCreated"}))
+	require.NoError(t, err)
+	require.NotEmpty(t, info, "the binding must be recorded even while disconnected")
+
+	// Start while disconnected must not panic; the loops wait for the broker.
+	c.Start(ctx)
 }
 
 func TestMessageTypeName(t *testing.T) {

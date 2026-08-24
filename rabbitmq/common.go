@@ -177,16 +177,27 @@ func (c *Client[E]) monitorConnection(ctx context.Context) {
 			}
 
 			c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect")
-			if err := c.connect(ctx); err != nil {
+			if err := c.reconnect(ctx); err != nil {
 				c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", "error", err)
 				continue
 			}
 
 			c.setup.logger.Info(ctx, "gorabbit: reconnected")
-			c.flushCachedMessages(ctx)
-			c.scheduleDelayedFlush(ctx)
 		}
 	}
+}
+
+// reconnect delivers whatever the cache holds as soon as the connection lands;
+// every path that connects goes through it so no flush is missed.
+func (c *Client[E]) reconnect(ctx context.Context) error {
+	if err := c.connect(ctx); err != nil {
+		return err
+	}
+
+	c.flushCachedMessages(ctx)
+	c.scheduleDelayedFlush(ctx)
+
+	return nil
 }
 
 func (c *Client[E]) scheduleDelayedFlush(ctx context.Context) {

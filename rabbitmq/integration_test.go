@@ -4,13 +4,18 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 	"uuid"
 
 	"github.com/diegoclair/gorabbit"
+	mobycontainer "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	amqp091 "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -194,13 +199,18 @@ func TestIntegrationCachedMessagesAreFlushedOnConnect(t *testing.T) {
 		}))
 	consumer.Start(ctx)
 
-	offline := newTestClient(NewSetup[shippingExchange](unreachableURL, "cached-producer").WithDialTimeout(200 * time.Millisecond))
-	offline.cache = cache
+	offline, err := NewSetup[shippingExchange](unreachableURL, "cached-producer").
+		WithDialTimeout(200 * time.Millisecond).
+		Connect(cache)
+	require.NoError(t, err)
+	require.False(t, offline.Connected())
 	require.NoError(t, offline.Publish(ctx, shipmentScheduled{OrderID: "first"}))
 	require.NoError(t, offline.Publish(ctx, shipmentScheduled{OrderID: "second"}))
+	offline.Close()
 
 	producer, err := NewSetup[shippingExchange](brokerURL, "cached-producer").Connect(cache)
 	require.NoError(t, err)
+	require.True(t, producer.Connected())
 	t.Cleanup(producer.Close)
 
 	for _, want := range []string{"first", "second"} {
@@ -292,6 +302,92 @@ func TestIntegrationPublishesPointerMessages(t *testing.T) {
 	require.NoError(t, producer.Publish(ctx, &stockReserved{SKU: "sku-1"}))
 
 	require.Equal(t, "sku-1", waitForMessage(t, received))
+}
+
+type notificationsExchange struct{}
+
+func (notificationsExchange) Name() string { return "notifications-events" }
+
+type notifications = gorabbit.Msg[notificationsExchange]
+
+type customerNotified struct {
+	notifications
+	ID string `json:"id"`
+}
+
+// The broker only comes up after Connect, RegisterHandler, Start and Publish:
+// the client must hold the message and the binding until the connection lands.
+func TestIntegrationOfflineClientDeliversOnceTheBrokerComesUp(t *testing.T) {
+	skipWithoutBroker(t)
+
+	ctx := context.Background()
+	port := freeLocalPort(t)
+	url := fmt.Sprintf("amqp://guest:guest@127.0.0.1:%d/", port)
+	received := make(chan string, 1)
+
+	client, err := NewSetup[notificationsExchange](url, "notifications-queue").
+		WithConsumer("notifications-queue").
+		WithDialTimeout(2 * time.Second).
+		WithReconnectDelay(200 * time.Millisecond).
+		Connect(gorabbit.NewMemoryCache())
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	require.False(t, client.Connected())
+
+	require.NoError(t, RegisterHandler(ctx, client, customerNotified{},
+		func(_ context.Context, msg customerNotified) error {
+			received <- msg.ID
+			return nil
+		}))
+	client.Start(ctx)
+	require.NoError(t, client.Publish(ctx, customerNotified{ID: "n-1"}))
+
+	startBrokerAt(t, port)
+
+	select {
+	case id := <-received:
+		require.Equal(t, "n-1", id)
+	case <-time.After(60 * time.Second):
+		t.Fatal("timed out waiting for the message published while offline")
+	}
+
+	require.Eventually(t, client.Connected, 10*time.Second, 100*time.Millisecond)
+}
+
+func freeLocalPort(t *testing.T) int {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+
+	return port
+}
+
+// startBrokerAt binds the broker to a fixed host port, so a client created
+// before the broker exists already knows the address it will reconnect to.
+func startBrokerAt(t *testing.T, port int) {
+	t.Helper()
+	ctx := context.Background()
+
+	broker, err := testcontainers.Run(ctx, "rabbitmq:4-alpine",
+		testcontainers.WithExposedPorts("5672/tcp"),
+		testcontainers.WithHostConfigModifier(func(hc *mobycontainer.HostConfig) {
+			hc.PortBindings = network.PortMap{
+				network.MustParsePort("5672/tcp"): {
+					{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: strconv.Itoa(port)},
+				},
+			}
+		}),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("Server startup complete").WithStartupTimeout(2*time.Minute),
+		),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, testcontainers.TerminateContainer(broker))
+	})
 }
 
 func waitForMessage(t *testing.T, messages <-chan string) string {

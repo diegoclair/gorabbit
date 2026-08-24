@@ -153,6 +153,7 @@ type Client[E gorabbit.Exchange] struct {
 	mu          sync.Mutex
 	done        chan struct{}
 	closeOnce   sync.Once
+	handlersMu  sync.RWMutex
 	handlers    map[string]handlerInfo
 }
 
@@ -165,10 +166,14 @@ func newClient[E gorabbit.Exchange](setup *Setup[E], cache gorabbit.Cache) *Clie
 	}
 }
 
-// Connect dials RabbitMQ, declares the configured topology and returns a ready
-// Client. The cache keeps messages that could not be published while the broker
-// is down and tracks the queue bindings, so it is required — use
-// gorabbit.NewMemoryCache when a shared store is not needed.
+// Connect validates the setup and returns a usable Client. An error means the
+// setup is invalid or the cache is missing — a broker outage is a state, not an
+// error: the client then starts disconnected, caches every publish, accepts
+// handler registrations and keeps reconnecting in background until the broker is
+// back, when it declares the topology, applies the bindings and flushes the
+// cache. The cache keeps those offline messages and tracks the queue bindings,
+// so it is required — use gorabbit.NewMemoryCache when a shared store is not
+// needed.
 func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -182,13 +187,12 @@ func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 
 	c := newClient(s, cache)
 
-	if err := c.connect(ctx); err != nil {
-		return nil, err
+	if err := c.reconnect(ctx); err != nil {
+		c.setup.logger.Warn(ctx, "gorabbit: broker unreachable, starting disconnected", "error", err)
 	}
 
-	// Messages cached while the broker (or this application) was down are only
-	// delivered now, on the first successful connection.
-	c.flushCachedMessages(ctx)
+	// Started here, not in Start: a publish-only client must also heal.
+	go c.monitorConnection(ctx)
 
 	return c, nil
 }
@@ -239,11 +243,9 @@ func (c *Client[E]) connect(ctx context.Context) error {
 	return nil
 }
 
-// Start launches the background loops. It is non-blocking and must be called
-// after every handler has been registered.
+// Start launches the consumer loops; connection monitoring runs since Connect.
+// It is non-blocking and must be called after every handler has been registered.
 func (c *Client[E]) Start(ctx context.Context) {
-	go c.monitorConnection(ctx)
-
 	if c.setup.isConsumer {
 		go c.consume(ctx)
 		go c.unbindUnusedBindings(ctx)
@@ -287,7 +289,28 @@ func (c *Client[E]) applyTopology(ctx context.Context) error {
 		return err
 	}
 
-	return c.bindQueues(ctx)
+	if err := c.bindQueues(ctx); err != nil {
+		return err
+	}
+
+	return c.bindRegisteredHandlers(ctx)
+}
+
+// bindRegisteredHandlers re-creates the binding of every registered handler,
+// which is what makes a registration done while disconnected effective. Caller
+// holds c.mu.
+func (c *Client[E]) bindRegisteredHandlers(ctx context.Context) error {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+
+	for _, hi := range c.handlers {
+		if err := c.bindQueueToExchange(ctx, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
+			c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *Client[E]) createTopicExchanges(ctx context.Context) error {
@@ -410,10 +433,33 @@ func (c *Client[E]) channel() (*amqp091.Channel, error) {
 	return c.ch, nil
 }
 
+// Connected reports whether the client holds a live connection right now — for
+// health checks and metrics. A disconnected client is still usable: publishes
+// are cached and registered handlers wait for the connection.
+func (c *Client[E]) Connected() bool { return c.connected() }
+
 func (c *Client[E]) connected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.isConnected
+}
+
+// bindHandler binds now when connected; while disconnected the binding is
+// applied by the next successful connection.
+func (c *Client[E]) bindHandler(ctx context.Context, hi handlerInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isConnected || c.ch == nil {
+		return
+	}
+
+	if err := c.bindQueueToExchange(ctx, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
+		// A failed bind closes the channel; dropping the connected state makes
+		// the reconnect loop rebuild it and re-bind every registered handler.
+		c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)
+		c.isConnected = false
+	}
 }
 
 func (c *Client[E]) setConnected(connected bool) {
