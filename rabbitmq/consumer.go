@@ -11,12 +11,18 @@ import (
 	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
-const handlerInfoCachePrefix = "gorabbit:handler-info"
+const (
+	handlerInfoCachePrefix = "gorabbit:handler-info"
+	// Set when a message is sent to the retry exchange: it comes back through
+	// this consumer's own exchange, and the original one is what tells apart two
+	// message types that share a name (and therefore a routing key).
+	originExchangeHeaderKey = "x-origin-exchange"
+)
 
-// RegisterHandler routes every message of type T to handler. It binds the
-// consumer queue to the exchange that owns the message type, so it must be
-// called before Start.
-func RegisterHandler[T gorabbit.Message](ctx context.Context, c *Client, msgType T, handler gorabbit.Handler[T]) error {
+// RegisterHandler routes every message of type T to handler, whatever exchange
+// owns T — consuming facts owned by other applications is the point. It binds
+// the consumer queue to that exchange, so it must be called before Start.
+func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Context, c *Client[E], msgType T, handler gorabbit.Handler[T]) error {
 	if !c.setup.isConsumer {
 		return errors.New("gorabbit: client is not a consumer, use WithConsumer")
 	}
@@ -25,18 +31,18 @@ func RegisterHandler[T gorabbit.Message](ctx context.Context, c *Client, msgType
 	}
 
 	msgName := messageTypeName(msgType)
-	exchangeOwnerName := msgType.ExchangeOwnerName()
-	if exchangeOwnerName == "" {
-		return fmt.Errorf("gorabbit: message %s has an empty exchange owner name", msgName)
+	exchange, err := exchangeOf(msgType)
+	if err != nil {
+		return err
 	}
 
-	if err := c.bindQueueToExchange(ctx, exchangeOwnerName, msgName, c.setup.queueName, true); err != nil {
+	if err := c.bindQueueToExchange(ctx, exchange, msgName, c.setup.queueName, true); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)
 		return err
 	}
 
 	hi := handlerInfo{
-		Exchange:   exchangeOwnerName,
+		Exchange:   exchange,
 		RoutingKey: msgName,
 		handler: func(ctx context.Context, msg amqp091.Delivery) error {
 			return handleMessageSafely(ctx, c, &msg, handler)
@@ -47,10 +53,7 @@ func RegisterHandler[T gorabbit.Message](ctx context.Context, c *Client, msgType
 		return err
 	}
 
-	c.handlers[handlersMapKey(exchangeOwnerName, msgName)] = hi
-	// A retried message comes back through this consumer's own exchange, so the
-	// same handler has to be reachable under it.
-	c.handlers[handlersMapKey(c.setup.queueName, msgName)] = hi
+	c.handlers[handlersMapKey(exchange, msgName)] = hi
 
 	return nil
 }
@@ -61,7 +64,7 @@ func handlersMapKey(exchange, routingKey string) string {
 
 // storeHandlerInfo records the binding so a later run can unbind it once the
 // handler is gone from the code.
-func (c *Client) storeHandlerInfo(ctx context.Context, info handlerInfo) error {
+func (c *Client[E]) storeHandlerInfo(ctx context.Context, info handlerInfo) error {
 	infoBytes, err := json.Marshal(info)
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to marshal handler info", "error", err)
@@ -76,13 +79,13 @@ func (c *Client) storeHandlerInfo(ctx context.Context, info handlerInfo) error {
 	return nil
 }
 
-func (c *Client) handlerInfoCacheKey(info handlerInfo) string {
+func (c *Client[E]) handlerInfoCacheKey(info handlerInfo) string {
 	return fmt.Sprintf("%s:%s:%s:%s", handlerInfoCachePrefix, c.setup.queueName, info.Exchange, info.RoutingKey)
 }
 
 // handleMessageSafely turns a panic inside the handler into an error, so one bad
 // message cannot take the consumer down.
-func handleMessageSafely[T gorabbit.Message](ctx context.Context, c *Client, msg *amqp091.Delivery, handler gorabbit.Handler[T]) (err error) {
+func handleMessageSafely[T gorabbit.Message, E gorabbit.Exchange](ctx context.Context, c *Client[E], msg *amqp091.Delivery, handler gorabbit.Handler[T]) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("gorabbit: panic recovered: %v", r)
@@ -106,7 +109,7 @@ func handleMessageSafely[T gorabbit.Message](ctx context.Context, c *Client, msg
 	return handler(ctx, payload)
 }
 
-func (c *Client) consume(ctx context.Context) {
+func (c *Client[E]) consume(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -131,7 +134,7 @@ func (c *Client) consume(ctx context.Context) {
 	}
 }
 
-func (c *Client) consumeMessages(ctx context.Context) error {
+func (c *Client[E]) consumeMessages(ctx context.Context) error {
 	ch, err := c.channel()
 	if err != nil {
 		return err
@@ -160,8 +163,25 @@ func (c *Client) consumeMessages(ctx context.Context) error {
 	return errors.New("gorabbit: consume channel closed unexpectedly")
 }
 
-func (c *Client) processMessage(ctx context.Context, msg amqp091.Delivery) error {
-	handlerInfo, ok := c.handlers[handlersMapKey(msg.Exchange, msg.RoutingKey)]
+// handlerFor resolves the handler by exchange and routing key. A retried message
+// arrives through this consumer's own exchange, so it is matched by the exchange
+// it was originally published to.
+func (c *Client[E]) handlerFor(msg *amqp091.Delivery) (handlerInfo, bool) {
+	exchange := msg.Exchange
+
+	if msg.Exchange == c.setup.queueName {
+		if origin, ok := msg.Headers[originExchangeHeaderKey].(string); ok && origin != "" {
+			exchange = origin
+		}
+	}
+
+	info, ok := c.handlers[handlersMapKey(exchange, msg.RoutingKey)]
+
+	return info, ok
+}
+
+func (c *Client[E]) processMessage(ctx context.Context, msg amqp091.Delivery) error {
+	handlerInfo, ok := c.handlerFor(&msg)
 	if !ok {
 		c.setup.logger.Error(ctx, "gorabbit: no handler for message", "message_type", msg.Type, "routing_key", msg.RoutingKey)
 		return msg.Nack(false, false) // no handler, no requeue
@@ -179,7 +199,7 @@ func (c *Client) processMessage(ctx context.Context, msg amqp091.Delivery) error
 	return msg.Ack(false)
 }
 
-func (c *Client) republishMessageToRetryExchange(ctx context.Context, msg *amqp091.Delivery) error {
+func (c *Client[E]) republishMessageToRetryExchange(ctx context.Context, msg *amqp091.Delivery) error {
 	retryCount := c.retryCount(ctx, msg) + 1
 
 	if retryCount > c.setup.retryCount {
@@ -201,6 +221,7 @@ func (c *Client) republishMessageToRetryExchange(ctx context.Context, msg *amqp0
 		msg.Headers = amqp091.Table{}
 	}
 	msg.Headers[retryCountHeaderKey] = retryCount
+	c.stampOriginExchange(msg)
 
 	c.setup.logger.Warn(ctx, "gorabbit: republishing message to retry exchange",
 		"message_type", msg.Type,
@@ -217,9 +238,23 @@ func (c *Client) republishMessageToRetryExchange(ctx context.Context, msg *amqp0
 	return msg.Ack(false)
 }
 
+// stampOriginExchange records where the message came from before it starts
+// bouncing through the retry topology. Later attempts arrive from this
+// consumer's own exchange, so only the first one carries the real origin.
+func (c *Client[E]) stampOriginExchange(msg *amqp091.Delivery) {
+	if msg.Exchange == c.setup.queueName {
+		return
+	}
+	if origin, ok := msg.Headers[originExchangeHeaderKey].(string); ok && origin != "" {
+		return
+	}
+
+	msg.Headers[originExchangeHeaderKey] = msg.Exchange
+}
+
 // republishMessage keeps the original routing key so a message coming back from
 // the retry exchange still reaches its handler.
-func (c *Client) republishMessage(ctx context.Context, exchange, routingKey string, msg *amqp091.Delivery) error {
+func (c *Client[E]) republishMessage(ctx context.Context, exchange, routingKey string, msg *amqp091.Delivery) error {
 	ch, err := c.channel()
 	if err != nil {
 		return err
@@ -249,7 +284,7 @@ func (c *Client) republishMessage(ctx context.Context, exchange, routingKey stri
 	return nil
 }
 
-func (c *Client) retryCount(ctx context.Context, msg *amqp091.Delivery) int {
+func (c *Client[E]) retryCount(ctx context.Context, msg *amqp091.Delivery) int {
 	val, ok := msg.Headers[retryCountHeaderKey]
 	if !ok {
 		return 0
@@ -270,7 +305,7 @@ func (c *Client) retryCount(ctx context.Context, msg *amqp091.Delivery) int {
 
 // unbindUnusedBindings removes bindings recorded by previous runs whose handler
 // no longer exists, so the queue stops receiving messages nothing handles.
-func (c *Client) unbindUnusedBindings(ctx context.Context) {
+func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 	ch, err := c.channel()
 	if err != nil {
 		return

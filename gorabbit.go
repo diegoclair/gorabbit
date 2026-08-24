@@ -6,18 +6,9 @@ package gorabbit
 
 import "context"
 
-// Message names the logical owner of its type, which for RabbitMQ is the topic
-// exchange the message is published to.
-type Message interface {
-	ExchangeOwnerName() string
-}
-
-// Handler handles one concrete message type; a returned error triggers the
-// driver's retry/dead-letter policy.
-type Handler[T Message] func(ctx context.Context, msg T) error
-
-type Publisher interface {
-	Publish(ctx context.Context, msg Message) error
+// Publisher publishes the messages of the exchange E it owns.
+type Publisher[E Exchange] interface {
+	Publish(ctx context.Context, msg OwnedBy[E]) error
 }
 
 // Consumer runs the background message handling; Start is non-blocking.

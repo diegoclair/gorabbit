@@ -15,67 +15,89 @@ import (
 
 const unreachableURL = "amqp://guest:guest@127.0.0.1:1/"
 
+type ordersExchange struct{}
+
+func (ordersExchange) Name() string { return "orders" }
+
+type orders = gorabbit.Msg[ordersExchange]
+
 type orderCreated struct {
+	orders
 	OrderID string `json:"order_id"`
 }
 
-func (orderCreated) ExchangeOwnerName() string { return "orders" }
+type billingExchange struct{}
 
-type noExchangeOwner struct{}
+func (billingExchange) Name() string { return "billing" }
 
-func (noExchangeOwner) ExchangeOwnerName() string { return "" }
+type billing = gorabbit.Msg[billingExchange]
 
-func newTestClient(setup *Setup) *Client {
-	return &Client{
-		setup:    setup,
-		cache:    gorabbit.NewMemoryCache(),
-		done:     make(chan struct{}),
-		handlers: make(map[string]handlerInfo),
-	}
+type envelope[T any] struct {
+	orders
+	Payload T `json:"payload"`
+}
+
+type unnamedExchange struct{}
+
+func (unnamedExchange) Name() string { return "" }
+
+type noExchangeName struct {
+	gorabbit.Msg[unnamedExchange]
+}
+
+var (
+	_ gorabbit.Publisher[ordersExchange] = (*Client[ordersExchange])(nil)
+	_ gorabbit.Consumer                  = (*Client[ordersExchange])(nil)
+)
+
+func newTestClient[E gorabbit.Exchange](setup *Setup[E]) *Client[E] {
+	return newClient(setup, gorabbit.NewMemoryCache())
 }
 
 func TestSetupValidate(t *testing.T) {
+	// Setups of different exchanges are different types; validate is what the
+	// table needs from all of them.
 	tests := []struct {
 		name    string
-		setup   *Setup
+		setup   interface{ validate() error }
 		wantErr string
 	}{
 		{
 			name:  "valid producer",
-			setup: NewSetup(unreachableURL, "orders", "app"),
+			setup: NewSetup[ordersExchange](unreachableURL, "app"),
 		},
 		{
 			name:  "valid consumer with retry",
-			setup: NewSetup(unreachableURL, "orders", "app").WithConsumer("app-queue").WithRetry(3, time.Second, nil),
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue").WithRetry(3, time.Second, nil),
 		},
 		{
 			name:    "missing amqp url",
-			setup:   NewSetup("", "orders", "app"),
+			setup:   NewSetup[ordersExchange]("", "app"),
 			wantErr: "amqp url is required",
 		},
 		{
-			name:    "missing exchange name",
-			setup:   NewSetup(unreachableURL, "", "app"),
+			name:    "marker with an empty exchange name",
+			setup:   NewSetup[unnamedExchange](unreachableURL, "app"),
 			wantErr: "exchange name is required",
 		},
 		{
 			name:    "missing app name",
-			setup:   NewSetup(unreachableURL, "orders", ""),
+			setup:   NewSetup[ordersExchange](unreachableURL, ""),
 			wantErr: "app name is required",
 		},
 		{
 			name:    "retry without consumer",
-			setup:   NewSetup(unreachableURL, "orders", "app").WithRetry(3, time.Second, nil),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithRetry(3, time.Second, nil),
 			wantErr: "retry is only available for consumers",
 		},
 		{
 			name:    "retry without count",
-			setup:   NewSetup(unreachableURL, "orders", "app").WithConsumer("q").WithRetry(0, time.Second, nil),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(0, time.Second, nil),
 			wantErr: "retry count must be greater than zero",
 		},
 		{
 			name:    "retry without interval",
-			setup:   NewSetup(unreachableURL, "orders", "app").WithConsumer("q").WithRetry(3, 0, nil),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(3, 0, nil),
 			wantErr: "retry interval must be greater than zero",
 		},
 	}
@@ -95,7 +117,7 @@ func TestSetupValidate(t *testing.T) {
 func TestSetupBuilders(t *testing.T) {
 	retryable := func(error) bool { return false }
 
-	s := NewSetup(unreachableURL, "orders", "app").
+	s := NewSetup[ordersExchange](unreachableURL, "app").
 		WithConsumer("app-queue").
 		WithRetry(5, 2*time.Second, retryable).
 		WithPrefetchCount(10).
@@ -114,7 +136,7 @@ func TestSetupBuilders(t *testing.T) {
 }
 
 func TestSetupOptionalDependenciesKeepDefaults(t *testing.T) {
-	s := NewSetup(unreachableURL, "orders", "app").
+	s := NewSetup[ordersExchange](unreachableURL, "app").
 		WithLogger(nil).
 		WithHeaderCarrier(nil).
 		WithReconnectDelay(0)
@@ -125,13 +147,13 @@ func TestSetupOptionalDependenciesKeepDefaults(t *testing.T) {
 }
 
 func TestConnectRequiresCache(t *testing.T) {
-	c, err := NewSetup(unreachableURL, "orders", "app").Connect(nil)
+	c, err := NewSetup[ordersExchange](unreachableURL, "app").Connect(nil)
 	require.ErrorContains(t, err, "cache is required")
 	require.Nil(t, c)
 }
 
 func TestConnectFailsWithUnreachableBroker(t *testing.T) {
-	c, err := NewSetup(unreachableURL, "orders", "app").WithDialTimeout(200 * time.Millisecond).Connect(gorabbit.NewMemoryCache())
+	c, err := NewSetup[ordersExchange](unreachableURL, "app").WithDialTimeout(200 * time.Millisecond).Connect(gorabbit.NewMemoryCache())
 	require.Error(t, err)
 	require.Nil(t, c)
 }
@@ -142,13 +164,172 @@ func TestMessageTypeName(t *testing.T) {
 	require.Empty(t, messageTypeName(nil))
 }
 
+// A generic message type resolves its exchange like any other, but its routing
+// key carries the instantiation — which is why the README asks for plain structs.
+func TestMessageTypeNameOfAGenericTypeCarriesTheInstantiation(t *testing.T) {
+	exchange, err := exchangeOf(envelope[orderCreated]{})
+	require.NoError(t, err)
+	require.Equal(t, "orders", exchange)
+
+	name := messageTypeName(envelope[orderCreated]{})
+	require.Equal(t, "envelope[github.com/diegoclair/gorabbit/rabbitmq.orderCreated]", name)
+}
+
+func TestExchangeOf(t *testing.T) {
+	t.Run("resolves the marked exchange for values and pointers", func(t *testing.T) {
+		exchange, err := exchangeOf(orderCreated{})
+		require.NoError(t, err)
+		require.Equal(t, "orders", exchange)
+
+		exchange, err = exchangeOf(&orderCreated{})
+		require.NoError(t, err)
+		require.Equal(t, "orders", exchange)
+	})
+
+	t.Run("rejects a typed nil pointer instead of panicking", func(t *testing.T) {
+		_, err := exchangeOf((*orderCreated)(nil))
+		require.ErrorContains(t, err, "message is nil")
+	})
+
+	t.Run("rejects a marker with an empty name", func(t *testing.T) {
+		_, err := exchangeOf(noExchangeName{})
+		require.ErrorContains(t, err, "empty exchange name")
+	})
+}
+
+// Two message types with the same name live in different exchanges: the routing
+// key collides on purpose and only the exchange tells them apart.
+func TestSameTypeNameInDifferentExchangesKeepsTheRoutingKey(t *testing.T) {
+	fromOrders, err := exchangeOf(orderCreated{})
+	require.NoError(t, err)
+
+	// Shadows the package-level message: same type name, other exchange.
+	type orderCreated struct {
+		billing
+		OrderID string `json:"order_id"`
+	}
+
+	fromBilling, err := exchangeOf(orderCreated{})
+	require.NoError(t, err)
+
+	require.Equal(t, "orderCreated", messageTypeName(orderCreated{}))
+	require.NotEqual(t, fromOrders, fromBilling)
+	require.NotEqual(t,
+		handlersMapKey(fromOrders, "orderCreated"),
+		handlersMapKey(fromBilling, "orderCreated"),
+	)
+}
+
+func TestSetupTakesTheExchangeNameFromTheMarker(t *testing.T) {
+	require.Equal(t, "orders", NewSetup[ordersExchange](unreachableURL, "app").exchangeName)
+	require.Equal(t, "billing", NewSetup[billingExchange](unreachableURL, "app").exchangeName)
+}
+
+func TestPublishRejectsANilMessage(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
+
+	require.ErrorContains(t, c.Publish(ctx, (*orderCreated)(nil)), "message is nil")
+
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", 0)+"*")
+	require.NoError(t, err)
+	require.Empty(t, keys, "an unpublishable message must not reach the cache")
+}
+
+func TestHandlerForUsesTheOriginExchangeOfRetriedMessages(t *testing.T) {
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+
+	// Same message name in two exchanges: only the exchange tells them apart.
+	fromOrders := handlerInfo{Exchange: "orders", RoutingKey: "orderCreated"}
+	fromBilling := handlerInfo{Exchange: "billing", RoutingKey: "orderCreated"}
+	c.handlers[handlersMapKey("orders", "orderCreated")] = fromOrders
+	c.handlers[handlersMapKey("billing", "orderCreated")] = fromBilling
+
+	tests := []struct {
+		name     string
+		delivery amqp091.Delivery
+		want     handlerInfo
+		wantOK   bool
+	}{
+		{
+			name:     "delivered by the owning exchange",
+			delivery: amqp091.Delivery{Exchange: "orders", RoutingKey: "orderCreated"},
+			want:     fromOrders,
+			wantOK:   true,
+		},
+		{
+			name: "retried through the consumer exchange keeps its origin",
+			delivery: amqp091.Delivery{
+				Exchange:   "app-queue",
+				RoutingKey: "orderCreated",
+				Headers:    amqp091.Table{originExchangeHeaderKey: "orders"},
+			},
+			want:   fromOrders,
+			wantOK: true,
+		},
+		{
+			name: "another origin, same routing key, other handler",
+			delivery: amqp091.Delivery{
+				Exchange:   "app-queue",
+				RoutingKey: "orderCreated",
+				Headers:    amqp091.Table{originExchangeHeaderKey: "billing"},
+			},
+			want:   fromBilling,
+			wantOK: true,
+		},
+		{
+			name:     "retried without an origin is not handled",
+			delivery: amqp091.Delivery{Exchange: "app-queue", RoutingKey: "orderCreated"},
+			wantOK:   false,
+		},
+		{
+			name: "origin without a handler is not handled",
+			delivery: amqp091.Delivery{
+				Exchange:   "app-queue",
+				RoutingKey: "orderCreated",
+				Headers:    amqp091.Table{originExchangeHeaderKey: "shipping"},
+			},
+			wantOK: false,
+		},
+		{
+			name:     "unknown exchange",
+			delivery: amqp091.Delivery{Exchange: "shipping", RoutingKey: "orderCreated"},
+			wantOK:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := c.handlerFor(&tt.delivery)
+			require.Equal(t, tt.wantOK, ok)
+			if tt.wantOK {
+				require.Equal(t, tt.want.Exchange, got.Exchange)
+			}
+		})
+	}
+}
+
+func TestStampOriginExchange(t *testing.T) {
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+
+	first := amqp091.Delivery{Exchange: "orders", Headers: amqp091.Table{}}
+	c.stampOriginExchange(&first)
+	require.Equal(t, "orders", first.Headers[originExchangeHeaderKey])
+
+	// A later attempt arrives from the consumer exchange and must not overwrite
+	// the origin recorded on the first one.
+	second := amqp091.Delivery{Exchange: "app-queue", Headers: first.Headers}
+	c.stampOriginExchange(&second)
+	require.Equal(t, "orders", second.Headers[originExchangeHeaderKey])
+}
+
 func TestCacheKey(t *testing.T) {
 	require.Equal(t, "gorabbit:cached_messages:app:", cacheKey("app", 0))
 	require.Equal(t, "gorabbit:cached_messages:app:42", cacheKey("app", 42))
 }
 
 func TestHandlerKeys(t *testing.T) {
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app").WithConsumer("app-queue"))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 	info := handlerInfo{Exchange: "orders", RoutingKey: "orderCreated"}
 
 	require.Equal(t, "orders:orderCreated", handlersMapKey(info.Exchange, info.RoutingKey))
@@ -157,7 +338,7 @@ func TestHandlerKeys(t *testing.T) {
 
 func TestPublishCachesMessageWhenBrokerIsUnreachable(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app").WithDialTimeout(200 * time.Millisecond))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithDialTimeout(200 * time.Millisecond))
 
 	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "123"}))
 
@@ -181,7 +362,7 @@ func TestPublishCachesMessageWhenBrokerIsUnreachable(t *testing.T) {
 
 func TestPublishMessagesGetSortableUniqueIDs(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app"))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 
 	first, err := c.getPublishMessage(ctx, orderCreated{})
 	require.NoError(t, err)
@@ -199,7 +380,7 @@ func TestPublishMessagesGetSortableUniqueIDs(t *testing.T) {
 
 func TestPublishCarriesContextHeaders(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app").WithHeaderCarrier(testCarrier{}))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithHeaderCarrier(testCarrier{}))
 
 	pm, err := c.getPublishMessage(context.WithValue(ctx, testCarrierKey, "abc-123"), orderCreated{})
 	require.NoError(t, err)
@@ -208,7 +389,7 @@ func TestPublishCarriesContextHeaders(t *testing.T) {
 
 func TestFlushCachedMessagesIsANoopWhileDisconnected(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app"))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 	require.NoError(t, c.cacheMessage(ctx, &publishMessage{MsgTypeName: "orderCreated", MsgBody: []byte(`{}`)}))
 
 	// No channel is open, so a flush that did not check the connection would panic.
@@ -221,7 +402,7 @@ func TestFlushCachedMessagesIsANoopWhileDisconnected(t *testing.T) {
 
 func TestGetMessagesFromCacheSortsByTimestampAndSkipsCorruptEntries(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app"))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 
 	newest := cachedMessage{MsgTypeName: "newest", Timestamp: time.Now()}
 	oldest := cachedMessage{MsgTypeName: "oldest", Timestamp: time.Now().Add(-time.Hour)}
@@ -241,7 +422,7 @@ func TestGetMessagesFromCacheSortsByTimestampAndSkipsCorruptEntries(t *testing.T
 }
 
 func TestRetryCountHeader(t *testing.T) {
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app"))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 	ctx := context.Background()
 
 	tests := []struct {
@@ -266,7 +447,7 @@ func TestRetryCountHeader(t *testing.T) {
 
 func TestHandleMessageSafely(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup(unreachableURL, "orders", "app"))
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 
 	t.Run("delivers the decoded payload", func(t *testing.T) {
 		var got orderCreated
@@ -312,21 +493,27 @@ func TestRegisterHandlerRejectsInvalidUsage(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("client is not a consumer", func(t *testing.T) {
-		c := newTestClient(NewSetup(unreachableURL, "orders", "app"))
+		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 		err := RegisterHandler(ctx, c, orderCreated{}, func(context.Context, orderCreated) error { return nil })
 		require.ErrorContains(t, err, "not a consumer")
 	})
 
 	t.Run("nil handler", func(t *testing.T) {
-		c := newTestClient(NewSetup(unreachableURL, "orders", "app").WithConsumer("app-queue"))
+		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		err := RegisterHandler[orderCreated](ctx, c, orderCreated{}, nil)
 		require.ErrorContains(t, err, "handler is required")
 	})
 
-	t.Run("message without an exchange owner", func(t *testing.T) {
-		c := newTestClient(NewSetup(unreachableURL, "orders", "app").WithConsumer("app-queue"))
-		err := RegisterHandler(ctx, c, noExchangeOwner{}, func(context.Context, noExchangeOwner) error { return nil })
-		require.ErrorContains(t, err, "empty exchange owner name")
+	t.Run("marker with an empty exchange name", func(t *testing.T) {
+		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		err := RegisterHandler(ctx, c, noExchangeName{}, func(context.Context, noExchangeName) error { return nil })
+		require.ErrorContains(t, err, "empty exchange name")
+	})
+
+	t.Run("nil message", func(t *testing.T) {
+		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		err := RegisterHandler(ctx, c, (*orderCreated)(nil), func(context.Context, *orderCreated) error { return nil })
+		require.ErrorContains(t, err, "message is nil")
 	})
 }
 

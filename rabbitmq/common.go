@@ -3,11 +3,13 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
 	"time"
 
+	"github.com/diegoclair/gorabbit"
 	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
@@ -28,7 +30,7 @@ type cachedMessage struct {
 	Timestamp   time.Time
 }
 
-func (c *Client) cacheMessage(ctx context.Context, pm *publishMessage) error {
+func (c *Client[E]) cacheMessage(ctx context.Context, pm *publishMessage) error {
 	cachedMsg := pm.toCacheMessage()
 
 	jsonMsg, err := json.Marshal(cachedMsg)
@@ -51,7 +53,7 @@ func (c *Client) cacheMessage(ctx context.Context, pm *publishMessage) error {
 	return nil
 }
 
-func (c *Client) flushCachedMessages(ctx context.Context) {
+func (c *Client[E]) flushCachedMessages(ctx context.Context) {
 	if !c.connected() {
 		return
 	}
@@ -77,7 +79,7 @@ func (c *Client) flushCachedMessages(ctx context.Context) {
 	}
 }
 
-func (c *Client) getMessagesFromCache(ctx context.Context) ([]cachedMessage, error) {
+func (c *Client[E]) getMessagesFromCache(ctx context.Context) ([]cachedMessage, error) {
 	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.setup.appName, 0)+"*")
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error retrieving cached message keys", "error", err)
@@ -121,6 +123,30 @@ func cacheKey(appName string, timestamp int64) string {
 	return key
 }
 
+// errNilMessage guards the typed nil: it marshals to "null" and panics on the
+// promoted marker method.
+var errNilMessage = errors.New("gorabbit: message is nil")
+
+func isNil(msg any) bool {
+	v := reflect.ValueOf(msg)
+	return !v.IsValid() || (v.Kind() == reflect.Pointer && v.IsNil())
+}
+
+// exchangeOf resolves the exchange a message is bound to — any exchange, since a
+// consumer handles messages it does not own.
+func exchangeOf(msg gorabbit.Message) (string, error) {
+	if isNil(msg) {
+		return "", errNilMessage
+	}
+
+	exchange := gorabbit.ExchangeOf(msg)
+	if exchange == "" {
+		return "", fmt.Errorf("gorabbit: message %s has an empty exchange name", messageTypeName(msg))
+	}
+
+	return exchange, nil
+}
+
 // messageTypeName is the routing key of a message: its concrete type name,
 // pointers dereferenced so *OrderCreated and OrderCreated route alike.
 func messageTypeName(msg any) string {
@@ -135,7 +161,7 @@ func messageTypeName(msg any) string {
 	return t.Name()
 }
 
-func (c *Client) monitorConnection(ctx context.Context) {
+func (c *Client[E]) monitorConnection(ctx context.Context) {
 	ticker := time.NewTicker(c.setup.reconnectDelay)
 	defer ticker.Stop()
 
@@ -163,7 +189,7 @@ func (c *Client) monitorConnection(ctx context.Context) {
 	}
 }
 
-func (c *Client) scheduleDelayedFlush(ctx context.Context) {
+func (c *Client[E]) scheduleDelayedFlush(ctx context.Context) {
 	go func() {
 		select {
 		case <-ctx.Done():

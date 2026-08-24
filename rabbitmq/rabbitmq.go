@@ -20,8 +20,9 @@ import (
 
 const defaultReconnectDelay = 2 * time.Second
 
-// Setup describes the topology to declare and the behaviour of the client.
-type Setup struct {
+// Setup describes the topology to declare and the behaviour of the client. E is
+// the exchange this application owns and publishes to.
+type Setup[E gorabbit.Exchange] struct {
 	amqpURL            string
 	exchangeName       string
 	appName            string
@@ -40,13 +41,15 @@ type Setup struct {
 	retryableErrorFunc func(error) bool
 }
 
-// NewSetup creates a topology setup. exchangeName is the topic exchange this
-// application publishes to (its ExchangeOwnerName), and appName identifies the
-// connection on the broker.
-func NewSetup(amqpURL, exchangeName, appName string) *Setup {
-	return &Setup{
+// NewSetup creates a topology setup for the exchange E, which the application
+// owns: it is declared on connect and is the only one this client publishes to.
+// appName identifies the connection on the broker.
+func NewSetup[E gorabbit.Exchange](amqpURL, appName string) *Setup[E] {
+	var exchange E
+
+	return &Setup[E]{
 		amqpURL:        amqpURL,
-		exchangeName:   exchangeName,
+		exchangeName:   exchange.Name(),
 		appName:        appName,
 		logger:         gorabbit.NoopLogger(),
 		headers:        gorabbit.NoopHeaderCarrier(),
@@ -56,7 +59,7 @@ func NewSetup(amqpURL, exchangeName, appName string) *Setup {
 
 // WithConsumer declares the queue this application consumes from, plus its
 // dead-letter queue.
-func (s *Setup) WithConsumer(queueName string) *Setup {
+func (s *Setup[E]) WithConsumer(queueName string) *Setup[E] {
 	s.queueName = queueName
 	s.dlqName = fmt.Sprintf("%s.dlq", queueName)
 	s.retryName = fmt.Sprintf("%s.retry", queueName)
@@ -67,7 +70,7 @@ func (s *Setup) WithConsumer(queueName string) *Setup {
 // WithRetry sets how many times a failed message is retried before going to the
 // dead-letter queue, and how long it waits between attempts. retryableErrorFunc
 // decides which errors are worth retrying; nil retries every error.
-func (s *Setup) WithRetry(retryCount int, retryInterval time.Duration, retryableErrorFunc func(error) bool) *Setup {
+func (s *Setup[E]) WithRetry(retryCount int, retryInterval time.Duration, retryableErrorFunc func(error) bool) *Setup[E] {
 	s.retryCount = retryCount
 	s.retryInterval = retryInterval
 	s.withRetry = true
@@ -77,12 +80,12 @@ func (s *Setup) WithRetry(retryCount int, retryInterval time.Duration, retryable
 
 // WithPrefetchCount limits how many unacknowledged messages the broker delivers
 // to this consumer at once.
-func (s *Setup) WithPrefetchCount(count int) *Setup {
+func (s *Setup[E]) WithPrefetchCount(count int) *Setup[E] {
 	s.preFetchCount = count
 	return s
 }
 
-func (s *Setup) WithLogger(l gorabbit.Logger) *Setup {
+func (s *Setup[E]) WithLogger(l gorabbit.Logger) *Setup[E] {
 	if l != nil {
 		s.logger = l
 	}
@@ -90,14 +93,14 @@ func (s *Setup) WithLogger(l gorabbit.Logger) *Setup {
 }
 
 // WithHeaderCarrier propagates ambient context values through message headers.
-func (s *Setup) WithHeaderCarrier(h gorabbit.HeaderCarrier) *Setup {
+func (s *Setup[E]) WithHeaderCarrier(h gorabbit.HeaderCarrier) *Setup[E] {
 	if h != nil {
 		s.headers = h
 	}
 	return s
 }
 
-func (s *Setup) WithReconnectDelay(d time.Duration) *Setup {
+func (s *Setup[E]) WithReconnectDelay(d time.Duration) *Setup[E] {
 	if d > 0 {
 		s.reconnectDelay = d
 	}
@@ -107,14 +110,14 @@ func (s *Setup) WithReconnectDelay(d time.Duration) *Setup {
 // WithDialTimeout bounds each connection attempt. Left unset, the amqp091
 // default (30s) applies, which is how long a publish can block before falling
 // back to the cache.
-func (s *Setup) WithDialTimeout(d time.Duration) *Setup {
+func (s *Setup[E]) WithDialTimeout(d time.Duration) *Setup[E] {
 	if d > 0 {
 		s.dialTimeout = d
 	}
 	return s
 }
 
-func (s *Setup) validate() error {
+func (s *Setup[E]) validate() error {
 	switch {
 	case s.amqpURL == "":
 		return errors.New("gorabbit: amqp url is required")
@@ -139,11 +142,12 @@ type handlerInfo struct {
 	handler    func(context.Context, amqp091.Delivery) error
 }
 
-// Client is a connection to RabbitMQ, used to publish and to consume.
-type Client struct {
+// Client is a connection to RabbitMQ, used to publish the messages of the
+// exchange E and to consume from any exchange.
+type Client[E gorabbit.Exchange] struct {
 	conn        *amqp091.Connection
 	ch          *amqp091.Channel
-	setup       *Setup
+	setup       *Setup[E]
 	cache       gorabbit.Cache
 	isConnected bool
 	mu          sync.Mutex
@@ -152,16 +156,20 @@ type Client struct {
 	handlers    map[string]handlerInfo
 }
 
-var (
-	_ gorabbit.Publisher = (*Client)(nil)
-	_ gorabbit.Consumer  = (*Client)(nil)
-)
+func newClient[E gorabbit.Exchange](setup *Setup[E], cache gorabbit.Cache) *Client[E] {
+	return &Client[E]{
+		setup:    setup,
+		cache:    cache,
+		done:     make(chan struct{}),
+		handlers: make(map[string]handlerInfo),
+	}
+}
 
 // Connect dials RabbitMQ, declares the configured topology and returns a ready
 // Client. The cache keeps messages that could not be published while the broker
 // is down and tracks the queue bindings, so it is required — use
 // gorabbit.NewMemoryCache when a shared store is not needed.
-func (s *Setup) Connect(cache gorabbit.Cache) (*Client, error) {
+func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -172,12 +180,7 @@ func (s *Setup) Connect(cache gorabbit.Cache) (*Client, error) {
 
 	ctx := context.Background()
 
-	c := &Client{
-		setup:    s,
-		cache:    cache,
-		done:     make(chan struct{}),
-		handlers: make(map[string]handlerInfo),
-	}
+	c := newClient(s, cache)
 
 	if err := c.connect(ctx); err != nil {
 		return nil, err
@@ -190,7 +193,7 @@ func (s *Setup) Connect(cache gorabbit.Cache) (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) connect(ctx context.Context) error {
+func (c *Client[E]) connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -238,7 +241,7 @@ func (c *Client) connect(ctx context.Context) error {
 
 // Start launches the background loops. It is non-blocking and must be called
 // after every handler has been registered.
-func (c *Client) Start(ctx context.Context) {
+func (c *Client[E]) Start(ctx context.Context) {
 	go c.monitorConnection(ctx)
 
 	if c.setup.isConsumer {
@@ -248,7 +251,7 @@ func (c *Client) Start(ctx context.Context) {
 }
 
 // Close stops the background loops and closes the connection. It is idempotent.
-func (c *Client) Close() {
+func (c *Client[E]) Close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
 
@@ -271,7 +274,7 @@ func (c *Client) Close() {
 	})
 }
 
-func (c *Client) applyTopology(ctx context.Context) error {
+func (c *Client[E]) applyTopology(ctx context.Context) error {
 	if err := c.createTopicExchanges(ctx); err != nil {
 		return err
 	}
@@ -287,7 +290,7 @@ func (c *Client) applyTopology(ctx context.Context) error {
 	return c.bindQueues(ctx)
 }
 
-func (c *Client) createTopicExchanges(ctx context.Context) error {
+func (c *Client[E]) createTopicExchanges(ctx context.Context) error {
 	if err := c.createTopicExchange(c.setup.exchangeName); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create topic exchange", "error", err)
 		return err
@@ -318,7 +321,7 @@ func (c *Client) createTopicExchanges(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) createQueues(ctx context.Context) error {
+func (c *Client[E]) createQueues(ctx context.Context) error {
 	if err := c.createQueue(c.setup.dlqName, nil); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create dlq queue", "error", err)
 		return err
@@ -347,7 +350,7 @@ func (c *Client) createQueues(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) bindQueues(ctx context.Context) error {
+func (c *Client[E]) bindQueues(ctx context.Context) error {
 	// "#" is the AMQP wildcard: these queues take every routing key, which is
 	// what lets a republished message keep the routing key it was published
 	// with instead of being flattened to an empty one.
@@ -371,11 +374,11 @@ func (c *Client) bindQueues(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) createTopicExchange(exchange string) error {
+func (c *Client[E]) createTopicExchange(exchange string) error {
 	return c.ch.ExchangeDeclare(exchange, "topic", true, false, false, false, nil)
 }
 
-func (c *Client) createQueue(queue string, args amqp091.Table) error {
+func (c *Client[E]) createQueue(queue string, args amqp091.Table) error {
 	_, err := c.ch.QueueDeclare(queue, true, false, false, false, args)
 	return err
 }
@@ -383,7 +386,7 @@ func (c *Client) createQueue(queue string, args amqp091.Table) error {
 // bindQueueToExchange binds a queue to an exchange. tryCreateExchange declares
 // the exchange first, needed when this consumer is not its owner and the owning
 // application may not have started yet.
-func (c *Client) bindQueueToExchange(ctx context.Context, exchange, routingKey, queueName string, tryCreateExchange bool) error {
+func (c *Client[E]) bindQueueToExchange(ctx context.Context, exchange, routingKey, queueName string, tryCreateExchange bool) error {
 	if tryCreateExchange {
 		if err := c.createTopicExchange(exchange); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to create topic exchange", "error", err)
@@ -396,7 +399,7 @@ func (c *Client) bindQueueToExchange(ctx context.Context, exchange, routingKey, 
 
 // channel guards the channel pointer, which a reconnection may swap while a
 // publisher or a consumer is using it.
-func (c *Client) channel() (*amqp091.Channel, error) {
+func (c *Client[E]) channel() (*amqp091.Channel, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -407,13 +410,13 @@ func (c *Client) channel() (*amqp091.Channel, error) {
 	return c.ch, nil
 }
 
-func (c *Client) connected() bool {
+func (c *Client[E]) connected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.isConnected
 }
 
-func (c *Client) setConnected(connected bool) {
+func (c *Client[E]) setConnected(connected bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.isConnected = connected

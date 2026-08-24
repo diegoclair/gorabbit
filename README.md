@@ -1,7 +1,8 @@
 # gorabbit
 
 <p align="center">
- <b>A typed, resilient RabbitMQ pub/sub client for Go — topic exchanges, retries, dead-letter queue and offline caching</b><br><br>
+ <b>A typed, resilient RabbitMQ pub/sub client for Go — topic exchanges, retries, dead-letter queue and offline caching</b><br>
+ <img src='./assets/gopher-rabbit.jpg' width='350'> <br>
     <a href="https://github.com/diegoclair/gorabbit/tags" alt="GitHub tag">
      <img src="https://img.shields.io/github/tag/diegoclair/gorabbit.svg" />
     </a>
@@ -39,60 +40,80 @@ Requires **Go 1.27+**.
 
 ## Quickstart
 
-A message is any struct that names the exchange owning it. The routing key is the
-struct's type name, so producer and consumer agree on a type, not on strings.
+One package per exchange, shared by the services that publish and consume it: the
+marker names the exchange, the alias is what every message embeds, and the facts
+live next to them. A message therefore carries its own destination — `Publish`
+takes no exchange, and the routing key is the struct's type name.
 
 ```go
+// package orders
+type Exchange struct{}
+
+func (Exchange) Name() string { return "orders" }
+
+type msg = gorabbit.Msg[Exchange] // unexported alias: the plumbing stays out of sight
+
 type OrderCreated struct {
+    msg
     OrderID string `json:"order_id"`
     Total   int64  `json:"total"`
 }
-
-func (OrderCreated) ExchangeOwnerName() string { return "orders" }
 ```
 
-### Producer
+Embedding `gorabbit.Msg[Exchange]` directly works too; the only difference is that
+the `Msg` field then shows up on the message for whoever imports it. Either way
+the marker has no fields and no exported methods, so it adds nothing to the JSON
+payload: `{"order_id":"123","total":4990}`.
+
+A struct without a marker is not a `gorabbit.Message` and does not compile — the
+mistake is caught by the compiler, never by the broker.
+
+### A service owns one exchange and consumes others
+
+The exchange a service owns is a type parameter of its client, so it is named
+once, at the composition root. That client publishes the facts of that exchange
+and consumes facts from any other.
 
 ```go
-client, err := rabbitmq.NewSetup(amqpURL, "orders", "orders-api").
+client, err := rabbitmq.NewSetup[orders.Exchange](amqpURL, "order-service").
+    WithConsumer("order-service").             // queue name
+    WithRetry(3, 30*time.Second, isRetryable). // retries before the DLQ
+    WithPrefetchCount(10).
     Connect(gorabbit.NewMemoryCache())
 if err != nil {
     log.Fatal(err)
 }
 defer client.Close()
 
-client.Start(ctx) // background reconnection loop
-
-err = client.Publish(ctx, OrderCreated{OrderID: "123", Total: 4990})
-```
-
-### Consumer
-
-```go
-consumer, err := rabbitmq.NewSetup(amqpURL, "billing", "billing-worker").
-    WithConsumer("billing-worker").            // queue name
-    WithRetry(3, 30*time.Second, isRetryable). // retries before the DLQ
-    WithPrefetchCount(10).
-    Connect(myCache)
-if err != nil {
-    log.Fatal(err)
-}
-defer consumer.Close()
-
-err = rabbitmq.RegisterHandler(ctx, consumer, OrderCreated{},
-    func(ctx context.Context, msg OrderCreated) error {
-        return billing.Charge(ctx, msg.OrderID, msg.Total)
+// Consuming a fact owned by another service.
+err = rabbitmq.RegisterHandler(ctx, client, payments.PaymentConfirmed{},
+    func(ctx context.Context, msg payments.PaymentConfirmed) error {
+        return orderService.MarkPaid(ctx, msg.OrderID)
     })
 if err != nil {
     log.Fatal(err)
 }
 
-consumer.Start(ctx) // call after every handler is registered
+client.Start(ctx) // call after every handler is registered
+
+// Publishing the fact this service owns.
+err = client.Publish(ctx, orders.OrderCreated{OrderID: "123", Total: 4990})
 ```
 
-`RegisterHandler` binds the queue to the exchange owning the message type,
-declaring that exchange if the producer has not started yet. A panic inside a
-handler is recovered and treated as a failure — it never takes the consumer down.
+`Publish` only accepts messages of the exchange the client owns:
+`client.Publish(ctx, payments.PaymentConfirmed{})` does not compile, so a service
+cannot forge another service's facts. `RegisterHandler` is deliberately free —
+consuming what others publish is the point — and binds the queue to the exchange
+owning the message, declaring it if that service has not started yet. Pointers
+publish alike: `*OrderCreated` and `OrderCreated` share the exchange and the
+routing key. A panic inside a handler is recovered and treated as a failure — it
+never takes the consumer down.
+
+Two message types may share a name — an `OrderCreated` in `orders` and another in
+`billing` — and therefore a routing key. The exchange separates them: each binding
+is `(exchange, routing key)`, and a message retried through the consumer's own
+exchange carries its origin in the `x-origin-exchange` header, so it comes back to
+the handler that owns it.
 
 ## Options
 
@@ -108,19 +129,36 @@ handler is recovered and treated as a failure — it never takes the consumer do
 
 ## Design: a neutral port and a driver
 
-The root package `gorabbit` holds the driver-neutral contracts — `Message`,
-`Handler`, `Publisher`, `Consumer`, `Cache`, `Logger`, `HeaderCarrier`. The
-`gorabbit/rabbitmq` subpackage is the RabbitMQ driver and depends on those
-contracts, never the other way around.
+The root package `gorabbit` holds the driver-neutral contracts — `Exchange`,
+`Msg`, `Message`, `OwnedBy`, `Handler`, `Publisher`, `Consumer`, `Cache`,
+`Logger`, `HeaderCarrier`. The `gorabbit/rabbitmq` subpackage is the RabbitMQ
+driver and depends on those contracts, never the other way around.
 
 Your domain code therefore imports only `gorabbit` (no AMQP types leak into it),
 and the broker choice stays at the composition root:
 
 ```go
-type Publisher interface {
-    Publish(ctx context.Context, msg gorabbit.Message) error // *rabbitmq.Client satisfies this
+type Publisher[E Exchange] interface {
+    Publish(ctx context.Context, msg OwnedBy[E]) error // *rabbitmq.Client[E] satisfies this
 }
 ```
+
+`Message` and `OwnedBy[E]` are satisfied only by embedding `Msg[E]`: the methods
+it promotes are unexported, so nothing else can implement them and there is
+nothing for application code to call. `Message` is any fact, whoever owns it;
+`OwnedBy[E]` is a fact of the exchange `E`.
+
+### What a message type may be
+
+- A named struct, exported or not, embedding one marker. The routing key is the
+  type name without the package.
+- A pointer to one. `Publish(ctx, &OrderCreated{})` is the same message; a typed
+  nil returns an error instead of panicking.
+- Not a generic type: the routing key of `Envelope[Order]` is the instantiated
+  name, brackets, dots and all. Wrap the payload in a plain struct instead.
+
+The marker itself must be a value type with a value receiver (`type Orders
+struct{}`), since it is resolved from its zero value.
 
 ## Retry and dead-letter
 

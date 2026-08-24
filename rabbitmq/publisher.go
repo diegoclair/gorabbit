@@ -39,7 +39,12 @@ func fromCacheMessage(cm *cachedMessage) publishMessage {
 	}
 }
 
-func (c *Client) getPublishMessage(ctx context.Context, msg gorabbit.Message) (*publishMessage, error) {
+func (c *Client[E]) getPublishMessage(ctx context.Context, msg gorabbit.OwnedBy[E]) (*publishMessage, error) {
+	if isNil(msg) {
+		c.setup.logger.Error(ctx, "gorabbit: error to publish message", "error", errNilMessage)
+		return nil, errNilMessage
+	}
+
 	body, err := json.Marshal(msg)
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to marshal message", "error", err)
@@ -60,10 +65,11 @@ func (c *Client) getPublishMessage(ctx context.Context, msg gorabbit.Message) (*
 	}, nil
 }
 
-// Publish sends a message to the configured exchange using the message type
-// name as routing key. When RabbitMQ is unreachable the message is cached and
-// published on the next successful connection.
-func (c *Client) Publish(ctx context.Context, msg gorabbit.Message) error {
+// Publish sends a message to the exchange this client owns, using the type name
+// as routing key. A message from another exchange does not compile. When
+// RabbitMQ is unreachable the message is cached and published on the next
+// successful connection.
+func (c *Client[E]) Publish(ctx context.Context, msg gorabbit.OwnedBy[E]) error {
 	pm, err := c.getPublishMessage(ctx, msg)
 	if err != nil {
 		return err
@@ -86,7 +92,7 @@ func (c *Client) Publish(ctx context.Context, msg gorabbit.Message) error {
 	return nil
 }
 
-func (c *Client) publish(ctx context.Context, pm *publishMessage) error {
+func (c *Client[E]) publish(ctx context.Context, pm *publishMessage) error {
 	ch, err := c.channel()
 	if err != nil {
 		return err
