@@ -119,11 +119,14 @@ func (c *Client[E]) consume(ctx context.Context) {
 		case <-c.done:
 			return
 		default:
+			// Reconnecting is the monitor's job alone; connect explains why.
 			if !c.connected() {
-				c.setup.logger.Info(ctx, "gorabbit: consumer not connected, attempting to reconnect")
-				if err := c.reconnect(ctx); err != nil {
-					c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", "error", err)
-					time.Sleep(c.setup.reconnectDelay)
+				select {
+				case <-ctx.Done():
+					return
+				case <-c.done:
+					return
+				case <-time.After(c.setup.reconnectDelay):
 				}
 				continue
 			}

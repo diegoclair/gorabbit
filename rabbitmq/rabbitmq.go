@@ -145,8 +145,11 @@ type handlerInfo struct {
 // Client is a connection to RabbitMQ, used to publish the messages of the
 // exchange E and to consume from any exchange.
 type Client[E gorabbit.Exchange] struct {
-	conn        *amqp091.Connection
-	ch          *amqp091.Channel
+	conn *amqp091.Connection
+	ch   *amqp091.Channel
+	// Publishing gets its own channel: amqp091 does not serialize a multi-frame
+	// publish against control methods (Consume, QueueBind) on the same channel.
+	pubCh       *amqp091.Channel
 	setup       *Setup[E]
 	cache       gorabbit.Cache
 	isConnected bool
@@ -201,8 +204,18 @@ func (c *Client[E]) connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Several loops notice a drop at once; only the first one may redial, or a
+	// live connection gets replaced under a publish in flight.
+	if c.live() {
+		return nil
+	}
 	c.isConnected = false
+
 	c.setup.logger.Info(ctx, "gorabbit: connecting to RabbitMQ")
+
+	if c.conn != nil && !c.conn.IsClosed() {
+		_ = c.conn.Close()
+	}
 
 	cfg := amqp091.Config{
 		Properties: amqp091.Table{"connection_name": c.setup.appName},
@@ -221,6 +234,12 @@ func (c *Client[E]) connect(ctx context.Context) error {
 	c.ch, err = c.conn.Channel()
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to open channel", "error", err)
+		return err
+	}
+
+	c.pubCh, err = c.conn.Channel()
+	if err != nil {
+		c.setup.logger.Error(ctx, "gorabbit: error to open publish channel", "error", err)
 		return err
 	}
 
@@ -260,8 +279,11 @@ func (c *Client[E]) Close() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
-		if c.ch != nil {
-			if err := c.ch.Close(); err != nil {
+		for _, ch := range []*amqp091.Channel{c.ch, c.pubCh} {
+			if ch == nil {
+				continue
+			}
+			if err := ch.Close(); err != nil {
 				c.setup.logger.Error(context.Background(), "gorabbit: error closing channel", "error", err)
 			}
 		}
@@ -433,6 +455,17 @@ func (c *Client[E]) channel() (*amqp091.Channel, error) {
 	return c.ch, nil
 }
 
+func (c *Client[E]) publishChannel() (*amqp091.Channel, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.live() || c.pubCh == nil {
+		return nil, errors.New("gorabbit: not connected")
+	}
+
+	return c.pubCh, nil
+}
+
 // Connected reports whether the client holds a live connection right now — for
 // health checks and metrics. A disconnected client is still usable: publishes
 // are cached and registered handlers wait for the connection.
@@ -441,7 +474,13 @@ func (c *Client[E]) Connected() bool { return c.connected() }
 func (c *Client[E]) connected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.isConnected
+	return c.live()
+}
+
+// live is the truth behind isConnected: a drop the broker side closes is
+// otherwise invisible to a client that never consumes. Caller holds c.mu.
+func (c *Client[E]) live() bool {
+	return c.isConnected && c.conn != nil && !c.conn.IsClosed()
 }
 
 // bindHandler binds now when connected; while disconnected the binding is

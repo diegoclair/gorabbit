@@ -92,7 +92,7 @@ func (c *Client[E]) Publish(ctx context.Context, msg gorabbit.OwnedBy[E]) error 
 }
 
 func (c *Client[E]) publish(ctx context.Context, pm *publishMessage) error {
-	ch, err := c.channel()
+	ch, err := c.publishChannel()
 	if err != nil {
 		return err
 	}
