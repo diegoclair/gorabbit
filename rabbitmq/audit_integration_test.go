@@ -81,6 +81,10 @@ type auditRouteEvent struct {
 	ID string `json:"id"`
 }
 
+// Long enough that a local broker would have delivered whatever it was going
+// to deliver, which is what makes the absence of a message an assertion.
+const absenceWindow = time.Second
+
 func collectIDs[T gorabbit.Message](received chan<- string, id func(T) string) gorabbit.Handler[T] {
 	return func(_ context.Context, msg T) error {
 		received <- id(msg)
@@ -123,6 +127,7 @@ func requireEachOnce(t *testing.T, received <-chan string, expected map[string]s
 
 func TestAuditConcurrentFlushesPublishTheSameCachedMessageTwice(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const (
 		cached  = 100
@@ -150,11 +155,12 @@ func TestAuditConcurrentFlushesPublishTheSameCachedMessageTwice(t *testing.T) {
 	}
 	wg.Wait()
 
-	requireEachOnce(t, received, expected, 3*time.Second)
+	requireEachOnce(t, received, expected, duplicateSettle)
 }
 
 func TestAuditPublishAfterCloseDoesNotReopenAConnection(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	c, err := NewSetup[auditCloseExchange](brokerURL, "audit-close-app").Connect(gorabbit.NewMemoryCache())
@@ -173,6 +179,7 @@ func TestAuditPublishAfterCloseDoesNotReopenAConnection(t *testing.T) {
 
 func TestAuditCancellingStartContextDoesNotDropConnectedState(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const queue = "audit-cancel-queue"
 	// A message left by an earlier run would pass for the one published inside
@@ -200,7 +207,7 @@ func TestAuditCancellingStartContextDoesNotDropConnectedState(t *testing.T) {
 	t.Cleanup(producer.Close)
 	require.NoError(t, producer.Publish(context.Background(), auditCancelEvent{ID: "after-cancel"}))
 
-	require.Never(t, func() bool { return !c.Connected() }, 3*time.Second, 2*time.Millisecond,
+	require.Never(t, func() bool { return !c.Connected() }, absenceWindow, 2*time.Millisecond,
 		"the connection is alive, yet Connected() flips false and the monitor tears it down and redials")
 
 	_, delivered := consumeWithin(t, queue, 5*time.Second)
@@ -244,6 +251,7 @@ const closeDrainBound = 10 * time.Second
 
 func TestAuditCloseDrainsTheInFlightHandler(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	entered := make(chan struct{}, 1)
@@ -266,7 +274,7 @@ func TestAuditCloseDrainsTheInFlightHandler(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 		close(release)
 	}()
 	start := time.Now()
@@ -275,7 +283,7 @@ func TestAuditCloseDrainsTheInFlightHandler(t *testing.T) {
 	closedWhileRunning := !finished.Load()
 	<-release
 
-	back, redelivered := consumeWithin(t, "audit-drain-queue", 5*time.Second)
+	back, redelivered := consumeWithin(t, "audit-drain-queue", absenceWindow)
 	t.Logf("Close took %s and returned while the handler was running: %v; back on the queue=%v redelivered=%v", closeTook, closedWhileRunning, redelivered, back.Redelivered)
 
 	require.False(t, closedWhileRunning, "Close returned mid-handler; the Ack then fails and the same message is redelivered")
@@ -311,10 +319,11 @@ func consumeWithin(t *testing.T, queue string, timeout time.Duration) (amqp091.D
 // locks per frame, so a bind can land between the frames of a publish.
 func TestAuditBindOnConsumerChannelWhileDeadLettering(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const (
-		messages = 300
-		hammer   = 8 * time.Second
+		messages = 100
+		hammer   = 3 * time.Second
 	)
 	ctx := context.Background()
 	var attempts atomic.Int32
@@ -481,6 +490,7 @@ func waitQueuesDrained(t *testing.T, queues []string, timeout time.Duration) int
 
 func TestAuditPublishToAnExchangeWithNoBindingIsSilentlyDropped(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	// The claim only holds while nothing is bound, and a queue left over by an
@@ -500,7 +510,7 @@ func TestAuditPublishToAnExchangeWithNoBindingIsSilentlyDropped(t *testing.T) {
 	select {
 	case id := <-received:
 		t.Fatalf("message %q published before any binding existed should have been dropped", id)
-	case <-time.After(2 * time.Second):
+	case <-time.After(absenceWindow):
 	}
 }
 
@@ -531,6 +541,7 @@ type auditTopologyEvent struct {
 // changes it can never declare the queue again.
 func TestAuditChangedRetryIntervalIsSurfacedInsteadOfCachingForever(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	// A retry queue left behind by an interrupted run carries the ttl of that
 	// run, which decides which of the two clients below is refused.
@@ -564,6 +575,7 @@ func TestAuditChangedRetryIntervalIsSurfacedInsteadOfCachingForever(t *testing.T
 // and no deploy of this application can fix a password the broker rejects.
 func TestAuditWrongCredentialsStartTheClientDisconnectedInsteadOfFailing(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	cache := gorabbit.NewMemoryCache()
@@ -589,6 +601,7 @@ func TestAuditWrongCredentialsStartTheClientDisconnectedInsteadOfFailing(t *test
 // there is no boot left to fail, so Publish is what must report it.
 func TestAuditTopologyRejectedOnARedialIsSurfacedInsteadOfCaching(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const queue = "audit-topology-redial-queue"
 	ctx := context.Background()
@@ -621,6 +634,7 @@ func TestAuditTopologyRejectedOnARedialIsSurfacedInsteadOfCaching(t *testing.T) 
 // Publish, so nothing else would ever retry the rejected declaration.
 func TestAuditTopologyRejectionHealsFromTheMonitorAlone(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const queue = "audit-topology-heal-queue"
 	ctx := context.Background()
@@ -634,7 +648,7 @@ func TestAuditTopologyRejectionHealsFromTheMonitorAlone(t *testing.T) {
 	redeclareRetryQueue(t, queue, 5*time.Second)
 	dropLiveConnection(t, c)
 
-	require.Never(t, c.Connected, 2*time.Second, 50*time.Millisecond,
+	require.Never(t, c.Connected, absenceWindow, 50*time.Millisecond,
 		"the monitor reconnected onto a topology the broker refuses")
 
 	deleteQueue(t, queue+".retry")

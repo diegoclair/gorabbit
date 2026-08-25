@@ -44,6 +44,8 @@ func brokerURL(t *testing.T) string {
 // One client publishes the fact its service owns and consumes a fact owned by
 // another service, which is the whole model.
 func TestServiceOwnsOneExchangeAndConsumesAnother(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	url := brokerURL(t)
 	tickets := make(chan TicketOpened, 1)
@@ -93,6 +95,8 @@ func TestServiceOwnsOneExchangeAndConsumesAnother(t *testing.T) {
 }
 
 func TestHiddenMarkerStaysOutOfTheStructAndThePayload(t *testing.T) {
+	t.Parallel()
+
 	body, err := json.Marshal(orders.OrderCreated{OrderID: "123"})
 	require.NoError(t, err)
 	require.JSONEq(t, `{"order_id":"123"}`, string(body))

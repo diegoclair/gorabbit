@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -126,6 +127,7 @@ func skipWithoutBroker(t *testing.T) {
 
 func TestIntegrationPublishAndConsume(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	received := make(chan orderCreated, 1)
@@ -155,6 +157,7 @@ func TestIntegrationPublishAndConsume(t *testing.T) {
 
 func TestIntegrationRetriesThenDeadLetters(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	var attempts atomic.Int32
@@ -186,6 +189,7 @@ func TestIntegrationRetriesThenDeadLetters(t *testing.T) {
 
 func TestIntegrationCachedMessagesAreFlushedOnConnect(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	cache := gorabbit.NewMemoryCache()
@@ -232,6 +236,7 @@ func TestIntegrationCachedMessagesAreFlushedOnConnect(t *testing.T) {
 // them apart. Each fact is published by the client that owns its exchange.
 func TestIntegrationSameTypeNameInDifferentExchanges(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	fromInvoices := make(chan string, 1)
@@ -286,6 +291,7 @@ func TestIntegrationSameTypeNameInDifferentExchanges(t *testing.T) {
 
 func TestIntegrationPublishesPointerMessages(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	received := make(chan string, 1)
@@ -319,6 +325,7 @@ type customerNotified struct {
 // the client must hold the message and the binding until the connection lands.
 func TestIntegrationOfflineClientDeliversOnceTheBrokerComesUp(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	port := freeLocalPort(t)
@@ -354,15 +361,36 @@ func TestIntegrationOfflineClientDeliversOnceTheBrokerComesUp(t *testing.T) {
 	require.Eventually(t, client.Connected, 10*time.Second, 100*time.Millisecond)
 }
 
+// The kernel may hand the same ephemeral port to two callers once it is
+// released, which would put two parallel tests' brokers on one address.
+var (
+	portsMu    sync.Mutex
+	takenPorts = map[int]struct{}{}
+)
+
 func freeLocalPort(t *testing.T) int {
 	t.Helper()
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
+	portsMu.Lock()
+	defer portsMu.Unlock()
 
-	return port
+	for range 50 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		port := l.Addr().(*net.TCPAddr).Port
+		require.NoError(t, l.Close())
+
+		if _, taken := takenPorts[port]; taken {
+			continue
+		}
+		takenPorts[port] = struct{}{}
+
+		return port
+	}
+
+	t.Fatal("no unused local port available")
+
+	return 0
 }
 
 // startBrokerAt binds the broker to a fixed host port, so a client created

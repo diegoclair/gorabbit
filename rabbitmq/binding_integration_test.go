@@ -49,6 +49,7 @@ type deadEvent struct {
 // keeps receiving what nothing handles until the cleanup unbinds it.
 func TestIntegrationUnbindDropsTheBindingOfAHandlerThatIsGone(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const queue = "unbind-queue"
 	ctx := context.Background()
@@ -81,13 +82,14 @@ func TestIntegrationUnbindDropsTheBindingOfAHandlerThatIsGone(t *testing.T) {
 	// the other one is the unbind and not a slow broker.
 	require.Equal(t, "kept", waitForMessage(t, received))
 
-	_, dead := consumeWithin(t, queue+".dlq", 3*time.Second)
+	_, dead := consumeWithin(t, queue+".dlq", absenceWindow)
 	require.False(t, dead, "the unbound message still reached the queue and was dead-lettered")
 	require.Zero(t, waitQueuesDrained(t, []string{queue}, 3*time.Second), "the unbound message is sitting in the queue")
 }
 
 func TestIntegrationDeliveryWithoutAHandlerIsDeadLetteredOnce(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const (
 		queue      = "stray-queue"
@@ -108,13 +110,14 @@ func TestIntegrationDeliveryWithoutAHandlerIsDeadLetteredOnce(t *testing.T) {
 	require.True(t, ok, "a delivery nothing handles must reach the dlq")
 	require.Equal(t, routingKey, dead.RoutingKey)
 
-	_, again := consumeWithin(t, queue+".dlq", 3*time.Second)
+	_, again := consumeWithin(t, queue+".dlq", absenceWindow)
 	require.False(t, again, "the delivery reached the dlq more than once")
 	require.Zero(t, waitQueuesDrained(t, []string{queue}, 3*time.Second))
 }
 
 func TestIntegrationHandlerErrorWithoutRetryIsDeadLetteredOnce(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const queue = "dead-queue"
 	ctx := context.Background()
@@ -135,7 +138,7 @@ func TestIntegrationHandlerErrorWithoutRetryIsDeadLetteredOnce(t *testing.T) {
 	require.Equal(t, "deadEvent", dead.Type)
 	require.JSONEq(t, `{"id":"dead"}`, string(dead.Body))
 
-	_, again := consumeWithin(t, queue+".dlq", 3*time.Second)
+	_, again := consumeWithin(t, queue+".dlq", absenceWindow)
 	require.False(t, again, "the failed message reached the dlq more than once")
 	require.Zero(t, waitQueuesDrained(t, []string{queue}, 3*time.Second))
 	require.Equal(t, int32(1), attempts.Load(), "without a retry queue the handler runs once")

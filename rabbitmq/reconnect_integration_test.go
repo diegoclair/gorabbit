@@ -34,8 +34,10 @@ type outageEvent struct {
 }
 
 const (
-	reconnectWait     = 60 * time.Second
-	duplicateSettle   = 3 * time.Second
+	reconnectWait = 60 * time.Second
+	// A replay reaches the consumer within a round trip of the delivery it
+	// duplicates, so the window only has to outlast a local broker hop.
+	duplicateSettle   = time.Second
 	testDialTimeout   = time.Second
 	testReconnectWait = 200 * time.Millisecond
 )
@@ -171,6 +173,7 @@ func publishBatch(t *testing.T, c *Client[outageExchange], prefix string, n int)
 
 func TestReconnectPublishBeforeBrokerExistsIsDeliveredOnce(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	port := freeLocalPort(t)
@@ -190,6 +193,7 @@ func TestReconnectPublishBeforeBrokerExistsIsDeliveredOnce(t *testing.T) {
 
 func TestReconnectManyPublishesWhileDownAreAllDeliveredOnce(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const n = 20
 	ctx := context.Background()
@@ -208,6 +212,7 @@ func TestReconnectManyPublishesWhileDownAreAllDeliveredOnce(t *testing.T) {
 
 func TestReconnectOutageMidRunDeliversEverythingOnceAndKeepsConsuming(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const n = 10
 	ctx := context.Background()
@@ -238,6 +243,7 @@ func TestReconnectOutageMidRunDeliversEverythingOnceAndKeepsConsuming(t *testing
 
 func TestReconnectConsumerOnlyClientSurvivesBrokerRestart(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	port := freeLocalPort(t)
@@ -270,26 +276,30 @@ func TestReconnectConsumerOnlyClientSurvivesBrokerRestart(t *testing.T) {
 
 func TestReconnectPublishOnlyClientHealsByItself(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const n = 5
 	ctx := context.Background()
-	port := freeLocalPort(t)
+	brokerPort := freeLocalPort(t)
+	producerPort := freeLocalPort(t)
 	received := make(chan string, n*4)
 
-	// A slow reconnect loop gives the consumer time to bind before the cache is
-	// flushed; a topic exchange with no bound queue drops what it receives.
-	producer := newOutageClient(t, port, false, func(s *Setup[outageExchange]) *Setup[outageExchange] {
-		return s.WithReconnectDelay(10 * time.Second)
-	})
+	startBrokerAt(t, brokerPort)
+
+	// Nothing answers on the producer's own port yet, however long the broker
+	// took to boot.
+	producer := newOutageClient(t, producerPort, false)
 	require.False(t, producer.Connected())
 	publishBatch(t, producer, "heal", n)
 
-	startBrokerAt(t, port)
-
-	consumer := newOutageClient(t, port, true)
+	consumer := newOutageClient(t, brokerPort, true)
 	require.True(t, consumer.Connected())
 	registerCollector(t, consumer, received)
 	consumer.Start(ctx)
+
+	// Opening the route is what lets the producer reach the broker at all, so
+	// the flush cannot run before the consumer is bound and lose the batch.
+	newBrokerProxyAt(t, producerPort, brokerURLAt(brokerPort))
 
 	// Healing must not depend on a later Publish call: only the background loop
 	// may bring the client back.
@@ -300,6 +310,7 @@ func TestReconnectPublishOnlyClientHealsByItself(t *testing.T) {
 
 func TestReconnectHandlerRegisteredWhileDisconnectedIsBoundOnConnect(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	port := freeLocalPort(t)
@@ -323,6 +334,7 @@ func TestReconnectHandlerRegisteredWhileDisconnectedIsBoundOnConnect(t *testing.
 
 func TestReconnectConcurrentPublishersDuringRecoveryDeliverExactlyOnce(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const (
 		publishers = 10
@@ -367,6 +379,7 @@ func TestReconnectConcurrentPublishersDuringRecoveryDeliverExactlyOnce(t *testin
 
 func TestReconnectCloseDuringOutageReturnsPromptly(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	port := freeLocalPort(t)
@@ -402,6 +415,7 @@ func TestReconnectCloseDuringOutageReturnsPromptly(t *testing.T) {
 
 func TestReconnectRetryInFlightSurvivesBrokerRestart(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	port := freeLocalPort(t)
@@ -445,6 +459,7 @@ func TestReconnectRetryInFlightSurvivesBrokerRestart(t *testing.T) {
 // went away; it must still notice, cache, and flush once the broker is back.
 func TestReconnectPublishOnlyClientSurvivesBrokerRestart(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	const n = 5
 	ctx := context.Background()
@@ -495,10 +510,18 @@ type brokerProxy struct {
 func newBrokerProxy(t *testing.T, target string) *brokerProxy {
 	t.Helper()
 
+	return newBrokerProxyAt(t, 0, target)
+}
+
+// newBrokerProxyAt listens on a port the client is already dialling, so the
+// test decides the instant that address starts answering.
+func newBrokerProxyAt(t *testing.T, port int, target string) *brokerProxy {
+	t.Helper()
+
 	u, err := url.Parse(target)
 	require.NoError(t, err)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	require.NoError(t, err)
 
 	p := &brokerProxy{listener: listener, target: u.Host, clientSent: make(chan struct{}, 1)}
@@ -576,6 +599,7 @@ func (p *brokerProxy) cut() {
 
 func TestReconnectPublishTornDownBeforeItsConfirmIsNotLost(t *testing.T) {
 	skipWithoutBroker(t)
+	t.Parallel()
 
 	ctx := context.Background()
 	cache := gorabbit.NewMemoryCache()
