@@ -45,15 +45,23 @@ func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Contex
 		},
 	}
 
-	if err := c.storeHandlerInfo(ctx, hi); err != nil {
-		return err
-	}
-
 	// Registered before binding: a connection landing in between re-binds every
 	// registered handler, so the bind is never lost.
+	key := handlersMapKey(exchange, msgName)
 	c.handlersMu.Lock()
-	c.handlers[handlersMapKey(exchange, msgName)] = hi
+	if _, ok := c.handlers[key]; ok {
+		c.handlersMu.Unlock()
+		return fmt.Errorf("gorabbit: a handler is already registered for %s", key)
+	}
+	c.handlers[key] = hi
 	c.handlersMu.Unlock()
+
+	if err := c.storeHandlerInfo(ctx, hi); err != nil {
+		c.handlersMu.Lock()
+		delete(c.handlers, key)
+		c.handlersMu.Unlock()
+		return err
+	}
 
 	c.bindHandler(ctx, hi)
 
@@ -112,6 +120,8 @@ func handleMessageSafely[T gorabbit.Message, E gorabbit.Exchange](ctx context.Co
 }
 
 func (c *Client[E]) consume(ctx context.Context) {
+	defer c.consumerWg.Done()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -140,32 +150,37 @@ func (c *Client[E]) consume(ctx context.Context) {
 }
 
 func (c *Client[E]) consumeMessages(ctx context.Context) error {
-	ch, err := c.channel()
-	if err != nil {
+	var msgs <-chan amqp091.Delivery
+	err := c.withConsumerChannel(func(ch *amqp091.Channel) error {
+		var err error
+		msgs, err = ch.Consume(c.setup.queueName, c.setup.appName, false, false, false, false, nil)
 		return err
-	}
-
-	msgs, err := ch.Consume(c.setup.queueName, c.setup.appName, false, false, false, false, nil)
+	})
 	if err != nil {
 		return fmt.Errorf("gorabbit: failed to start consuming messages: %w", err)
 	}
 
 	c.setup.logger.Info(ctx, "gorabbit: started consuming messages", "queue", c.setup.queueName)
 
-	for msg := range msgs {
+	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// Only consuming stops here: the connection is intact and still
+			// publishes, so no delivery may be pulled and left unacked.
+			c.cancelConsumer()
+			return nil
 		case <-c.done:
 			return nil
-		default:
+		case msg, ok := <-msgs:
+			if !ok {
+				return errors.New("gorabbit: consume channel closed unexpectedly")
+			}
+
 			if err := c.processMessage(ctx, msg); err != nil {
 				c.setup.logger.Error(ctx, "gorabbit: error processing message", "error", err)
 			}
 		}
 	}
-
-	return errors.New("gorabbit: consume channel closed unexpectedly")
 }
 
 // handlerFor resolves the handler by exchange and routing key. A retried message
@@ -216,12 +231,9 @@ func (c *Client[E]) republishMessageToRetryExchange(ctx context.Context, msg *am
 			"message_id", msg.MessageId,
 		)
 
-		// Ack first so the broker does not also dead-letter it on its own.
-		if err := msg.Ack(false); err != nil {
-			c.setup.logger.Error(ctx, "gorabbit: error to ack message", "error", err)
-		}
-
-		return c.republishMessage(ctx, c.setup.dlqName, msg.RoutingKey, msg)
+		// The queue's dead-letter exchange routes it, so no publish of ours can
+		// die after the delivery is already acked.
+		return msg.Nack(false, false)
 	}
 
 	if msg.Headers == nil {
@@ -262,12 +274,7 @@ func (c *Client[E]) stampOriginExchange(msg *amqp091.Delivery) {
 // republishMessage keeps the original routing key so a message coming back from
 // the retry exchange still reaches its handler.
 func (c *Client[E]) republishMessage(ctx context.Context, exchange, routingKey string, msg *amqp091.Delivery) error {
-	ch, err := c.channel()
-	if err != nil {
-		return err
-	}
-
-	err = ch.Publish(exchange, routingKey, false, false, amqp091.Publishing{
+	err := c.publishConfirmed(ctx, exchange, routingKey, amqp091.Publishing{
 		ContentType:     msg.ContentType,
 		ContentEncoding: msg.ContentEncoding,
 		Type:            msg.Type,
@@ -327,11 +334,6 @@ func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 		}
 	}
 
-	ch, err := c.channel()
-	if err != nil {
-		return
-	}
-
 	keys, err := c.cache.GetAllKeys(ctx, fmt.Sprintf("%s:%s:*", handlerInfoCachePrefix, c.setup.queueName))
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to get handler info keys", "error", err)
@@ -367,7 +369,10 @@ func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 			"queue", c.setup.queueName,
 		)
 
-		if err := ch.QueueUnbind(c.setup.queueName, info.RoutingKey, info.Exchange, nil); err != nil {
+		err = c.withConsumerChannel(func(ch *amqp091.Channel) error {
+			return ch.QueueUnbind(c.setup.queueName, info.RoutingKey, info.Exchange, nil)
+		})
+		if err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to unbind queue", "error", err)
 			continue
 		}

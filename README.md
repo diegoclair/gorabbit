@@ -78,7 +78,7 @@ client, err := rabbitmq.NewSetup[orders.Exchange](amqpURL, "order-service").
     WithPrefetchCount(10).
     Connect(gorabbit.NewMemoryCache())
 if err != nil {
-    log.Fatal(err) // only an invalid setup: a broker outage is not an error
+    log.Fatal(err) // an invalid setup or a refused topology; an outage is not an error
 }
 defer client.Close()
 
@@ -104,7 +104,10 @@ consuming what others publish is the point — and binds the queue to the exchan
 owning the message, declaring it if that service has not started yet. Pointers
 publish alike: `*OrderCreated` and `OrderCreated` share the exchange and the
 routing key. A panic inside a handler is recovered and treated as a failure — it
-never takes the consumer down.
+never takes the consumer down. A second handler for the same `(exchange, routing
+key)` is rejected instead of replacing the first, and a message type with no name
+(an anonymous struct) is rejected by `Publish`: its routing key would be empty and
+match no binding.
 
 Two message types may share a name — an `OrderCreated` in `orders` and another in
 `billing` — and therefore a routing key. The exchange separates them: each binding
@@ -123,6 +126,7 @@ the handler that owns it.
 | `WithHeaderCarrier(h)` | Propagate context values as message headers |
 | `WithReconnectDelay(d)` | Wait between reconnection attempts (default 2s) |
 | `WithDialTimeout(d)` | Bound each connection attempt (default: the amqp091 30s) |
+| `WithPublishConfirmTimeout(d)` | Bound the wait for the broker's publish confirmation (default 5s) |
 
 ## Design: a neutral port and a driver
 
@@ -168,11 +172,12 @@ right away.
 ## Offline caching and reconnection
 
 A client is always usable; a broker outage is a state, not an error. `Connect`
-returns an error only for an invalid setup or a missing cache — when RabbitMQ is
-unreachable it returns a live client that starts disconnected, keeps
-reconnecting in background (`WithReconnectDelay` between attempts, each one
-bounded by `WithDialTimeout`) and heals itself on the first successful
-connection:
+returns an error only for an invalid setup, a missing cache or a topology the
+broker refuses — when the dial itself fails, whether the broker is down, the
+address is wrong or the credentials are refused, it returns a live client
+that starts disconnected, keeps reconnecting in background (`WithReconnectDelay`
+between attempts, each one bounded by `WithDialTimeout`) and heals itself on the
+first successful connection:
 
 - `Publish` stores the message in the `Cache` and returns nil; cached messages
   are published — in order — on the next successful connection.
@@ -181,6 +186,16 @@ connection:
   consumer starts consuming.
 - `Connected()` reports the current state — for health checks and metrics, never
   a precondition for calling anything.
+- A topology the broker refuses — a queue argument changed between deploys, say —
+  is not an outage: it is refused on every attempt. At the first connect
+  `Connect` fails with `rabbitmq.ErrTopologyRejected` and hands back no client;
+  when the rejection appears on a later redial, `Publish` returns that same error
+  instead of caching, `Connected()` stays false and the background loop keeps
+  retrying until the broker (or the deploy) is fixed.
+- Cancelling the `Start` context stops consuming; the client stays connected and
+  keeps publishing until `Close`.
+- After `Close`, `Publish` neither caches nor reconnects: it returns
+  `rabbitmq.ErrClientClosed`.
 
 Each registered handler is also recorded in the cache, so on the next start
 bindings whose handler no longer exists in the code are unbound.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/diegoclair/gorabbit"
@@ -18,7 +19,27 @@ import (
 // Ordering requires Single Active Consumer plus a partitioning key, which is an
 // application-level decision.
 
-const defaultReconnectDelay = 2 * time.Second
+const (
+	defaultReconnectDelay = 2 * time.Second
+	// A confirm that never arrives must not block the caller forever.
+	defaultPublishConfirmTimeout = 5 * time.Second
+	// A handler that never returns must not hold Close forever.
+	closeDrainTimeout = 30 * time.Second
+)
+
+// ErrClientClosed is returned by Publish once Close has run: a closed client
+// never reopens a connection, so the message is neither sent nor cached.
+var ErrClientClosed = errors.New("gorabbit: client is closed")
+
+// ErrTopologyRejected reports a declared topology the broker refuses on every
+// attempt. Only a deploy fixes it, so Connect and Publish surface it instead of
+// starting disconnected and caching until the cache expires.
+var ErrTopologyRejected = errors.New("gorabbit: broker rejected the topology")
+
+var (
+	errNotConnected   = errors.New("gorabbit: not connected")
+	errDialInProgress = errors.New("gorabbit: a connection attempt is already in progress")
+)
 
 // Setup describes the topology to declare and the behaviour of the client. E is
 // the exchange this application owns and publishes to.
@@ -37,6 +58,7 @@ type Setup[E gorabbit.Exchange] struct {
 	retryInterval      time.Duration
 	reconnectDelay     time.Duration
 	dialTimeout        time.Duration
+	confirmTimeout     time.Duration
 	isConsumer         bool
 	retryableErrorFunc func(error) bool
 }
@@ -54,6 +76,7 @@ func NewSetup[E gorabbit.Exchange](amqpURL, appName string) *Setup[E] {
 		logger:         gorabbit.NoopLogger(),
 		headers:        gorabbit.NoopHeaderCarrier(),
 		reconnectDelay: defaultReconnectDelay,
+		confirmTimeout: defaultPublishConfirmTimeout,
 	}
 }
 
@@ -117,6 +140,13 @@ func (s *Setup[E]) WithDialTimeout(d time.Duration) *Setup[E] {
 	return s
 }
 
+// WithPublishConfirmTimeout bounds the wait for the broker's confirmation, past
+// which the publish is treated as failed rather than delivered.
+func (s *Setup[E]) WithPublishConfirmTimeout(d time.Duration) *Setup[E] {
+	s.confirmTimeout = d
+	return s
+}
+
 func (s *Setup[E]) validate() error {
 	switch {
 	case s.amqpURL == "":
@@ -131,9 +161,19 @@ func (s *Setup[E]) validate() error {
 		return errors.New("gorabbit: retry count must be greater than zero")
 	case s.withRetry && s.retryInterval <= 0:
 		return errors.New("gorabbit: retry interval must be greater than zero")
+	case s.confirmTimeout <= 0:
+		return errors.New("gorabbit: publish confirm timeout must be greater than zero")
 	}
 
 	return nil
+}
+
+// The connection and its channels are swapped in as one: a client holding
+// channels from two connections would publish over a socket nobody watches.
+type brokerConn struct {
+	conn  *amqp091.Connection
+	ch    *amqp091.Channel
+	pubCh *amqp091.Channel
 }
 
 type handlerInfo struct {
@@ -153,11 +193,17 @@ type Client[E gorabbit.Exchange] struct {
 	setup       *Setup[E]
 	cache       gorabbit.Cache
 	isConnected bool
-	mu          sync.Mutex
-	done        chan struct{}
-	closeOnce   sync.Once
-	handlersMu  sync.RWMutex
-	handlers    map[string]handlerInfo
+	// setupErr holds the last topology rejection, so a caller that skipped the
+	// dial answers with it instead of caching behind it.
+	setupErr   error
+	mu         sync.Mutex
+	done       chan struct{}
+	closeOnce  sync.Once
+	consumerWg sync.WaitGroup
+	dialing    atomic.Bool
+	flushing   atomic.Bool
+	handlersMu sync.RWMutex
+	handlers   map[string]handlerInfo
 }
 
 func newClient[E gorabbit.Exchange](setup *Setup[E], cache gorabbit.Cache) *Client[E] {
@@ -170,13 +216,13 @@ func newClient[E gorabbit.Exchange](setup *Setup[E], cache gorabbit.Cache) *Clie
 }
 
 // Connect validates the setup and returns a usable Client. An error means the
-// setup is invalid or the cache is missing — a broker outage is a state, not an
-// error: the client then starts disconnected, caches every publish, accepts
-// handler registrations and keeps reconnecting in background until the broker is
-// back, when it declares the topology, applies the bindings and flushes the
-// cache. The cache keeps those offline messages and tracks the queue bindings,
-// so it is required — use gorabbit.NewMemoryCache when a shared store is not
-// needed.
+// setup is invalid, the cache is missing or the broker rejected the topology —
+// a broker outage is a state, not an error: the client then starts
+// disconnected, caches every publish, accepts handler registrations and keeps
+// reconnecting in background until the broker is back, when it declares the
+// topology, applies the bindings and flushes the cache. The cache keeps those
+// offline messages and tracks the queue bindings, so it is required — use
+// gorabbit.NewMemoryCache when a shared store is not needed.
 func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 	if err := s.validate(); err != nil {
 		return nil, err
@@ -191,6 +237,14 @@ func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 	c := newClient(s, cache)
 
 	if err := c.reconnect(ctx); err != nil {
+		// Only a deploy fixes a refused topology, so it must stop the boot
+		// instead of leaving a client that can never publish.
+		if errors.Is(err, ErrTopologyRejected) {
+			c.setup.logger.Error(ctx, "gorabbit: broker rejected the topology", "error", err)
+			c.Close()
+			return nil, err
+		}
+
 		c.setup.logger.Warn(ctx, "gorabbit: broker unreachable, starting disconnected", "error", err)
 	}
 
@@ -200,23 +254,51 @@ func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 	return c, nil
 }
 
-func (c *Client[E]) connect(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// The bool tells the caller it is the one that brought the connection up, so a
+// single flush of the cache follows a reconnection.
+func (c *Client[E]) connect(ctx context.Context) (bool, error) {
+	if c.closed() {
+		return false, ErrClientClosed
+	}
 
 	// Several loops notice a drop at once; only the first one may redial, or a
 	// live connection gets replaced under a publish in flight.
-	if c.live() {
-		return nil
+	if c.connected() {
+		return false, nil
 	}
-	c.isConnected = false
+
+	// Whoever finds a dial in flight does not queue behind it: waiting a whole
+	// dial timeout is exactly what the offline path exists to avoid.
+	if !c.dialing.CompareAndSwap(false, true) {
+		return false, c.pendingErr()
+	}
+	defer c.dialing.Store(false)
+
+	if c.connected() {
+		return false, nil
+	}
 
 	c.setup.logger.Info(ctx, "gorabbit: connecting to RabbitMQ")
+	c.dropConnection()
 
-	if c.conn != nil && !c.conn.IsClosed() {
-		_ = c.conn.Close()
+	bc, err := c.dial(ctx)
+	if err != nil {
+		return false, c.failedDial(err)
 	}
 
+	if err := c.establish(ctx, bc); err != nil {
+		_ = bc.conn.Close()
+		return false, c.failedSetup(err)
+	}
+
+	c.setup.logger.Info(ctx, "gorabbit: connected to RabbitMQ")
+
+	return true, nil
+}
+
+// dial runs with no lock held: a broker that swallows the handshake would
+// otherwise hold Close, Connected and every publisher for a whole dial timeout.
+func (c *Client[E]) dial(ctx context.Context) (*brokerConn, error) {
 	cfg := amqp091.Config{
 		Properties: amqp091.Table{"connection_name": c.setup.appName},
 	}
@@ -224,48 +306,90 @@ func (c *Client[E]) connect(ctx context.Context) error {
 		cfg.Dial = amqp091.DefaultDial(c.setup.dialTimeout)
 	}
 
-	var err error
-	c.conn, err = amqp091.DialConfig(c.setup.amqpURL, cfg)
+	conn, err := amqp091.DialConfig(c.setup.amqpURL, cfg)
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to dial amqp", "error", err)
-		return err
+		return nil, err
 	}
 
-	c.ch, err = c.conn.Channel()
+	bc := &brokerConn{conn: conn}
+
+	bc.ch, err = conn.Channel()
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to open channel", "error", err)
-		return err
+		_ = conn.Close()
+		return nil, err
 	}
 
-	c.pubCh, err = c.conn.Channel()
+	bc.pubCh, err = conn.Channel()
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to open publish channel", "error", err)
-		return err
+		_ = conn.Close()
+		return nil, err
 	}
 
-	if c.setup.isConsumer {
-		if c.setup.preFetchCount > 0 {
-			if err = c.ch.Qos(c.setup.preFetchCount, 0, false); err != nil {
-				c.setup.logger.Error(ctx, "gorabbit: error to set prefetch count", "error", err)
-				return err
-			}
+	// Without confirms the broker never answers a publish, so a message lost
+	// between the socket and the queue would look delivered.
+	if err = bc.pubCh.Confirm(false); err != nil {
+		c.setup.logger.Error(ctx, "gorabbit: error to put the publish channel in confirm mode", "error", err)
+		_ = conn.Close()
+		return nil, err
+	}
+
+	if c.setup.isConsumer && c.setup.preFetchCount > 0 {
+		if err = bc.ch.Qos(c.setup.preFetchCount, 0, false); err != nil {
+			c.setup.logger.Error(ctx, "gorabbit: error to set prefetch count", "error", err)
+			_ = conn.Close()
+			return nil, err
 		}
 	}
 
-	if err := c.applyTopology(ctx); err != nil {
+	return bc, nil
+}
+
+// Nothing may use the connection before its topology exists, and a handler
+// registered meanwhile must be bound by exactly one of the two sides.
+func (c *Client[E]) establish(ctx context.Context, bc *brokerConn) error {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+
+	if err := c.applyTopology(ctx, bc.ch); err != nil {
 		return err
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed() {
+		return ErrClientClosed
+	}
+
+	c.conn, c.ch, c.pubCh = bc.conn, bc.ch, bc.pubCh
+	c.setupErr = nil
 	c.isConnected = true
-	c.setup.logger.Info(ctx, "gorabbit: connected to RabbitMQ")
 
 	return nil
+}
+
+// dropConnection lets go of the dead connection before the redial, so nothing
+// reaches for a channel that belongs to it.
+func (c *Client[E]) dropConnection() {
+	c.mu.Lock()
+	conn := c.conn
+	c.conn, c.ch, c.pubCh = nil, nil, nil
+	c.isConnected = false
+	c.mu.Unlock()
+
+	if conn != nil && !conn.IsClosed() {
+		_ = conn.Close()
+	}
 }
 
 // Start launches the consumer loops; connection monitoring runs since Connect.
 // It is non-blocking and must be called after every handler has been registered.
 func (c *Client[E]) Start(ctx context.Context) {
 	if c.setup.isConsumer {
+		c.consumerWg.Add(1)
 		go c.consume(ctx)
 		go c.unbindUnusedBindings(ctx)
 	}
@@ -275,6 +399,11 @@ func (c *Client[E]) Start(ctx context.Context) {
 func (c *Client[E]) Close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
+
+		// The broker must stop delivering, and the delivery already in a
+		// handler must reach its ack, before the channel goes away.
+		c.cancelConsumer()
+		c.waitForConsumer()
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -298,8 +427,8 @@ func (c *Client[E]) Close() {
 	})
 }
 
-func (c *Client[E]) applyTopology(ctx context.Context) error {
-	if err := c.createTopicExchanges(ctx); err != nil {
+func (c *Client[E]) applyTopology(ctx context.Context, ch *amqp091.Channel) error {
+	if err := c.createTopicExchanges(ctx, ch); err != nil {
 		return err
 	}
 
@@ -307,26 +436,23 @@ func (c *Client[E]) applyTopology(ctx context.Context) error {
 		return nil
 	}
 
-	if err := c.createQueues(ctx); err != nil {
+	if err := c.createQueues(ctx, ch); err != nil {
 		return err
 	}
 
-	if err := c.bindQueues(ctx); err != nil {
+	if err := c.bindQueues(ctx, ch); err != nil {
 		return err
 	}
 
-	return c.bindRegisteredHandlers(ctx)
+	return c.bindRegisteredHandlers(ctx, ch)
 }
 
 // bindRegisteredHandlers re-creates the binding of every registered handler,
 // which is what makes a registration done while disconnected effective. Caller
-// holds c.mu.
-func (c *Client[E]) bindRegisteredHandlers(ctx context.Context) error {
-	c.handlersMu.RLock()
-	defer c.handlersMu.RUnlock()
-
+// holds c.handlersMu.
+func (c *Client[E]) bindRegisteredHandlers(ctx context.Context, ch *amqp091.Channel) error {
 	for _, hi := range c.handlers {
-		if err := c.bindQueueToExchange(ctx, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
+		if err := c.bindQueueToExchange(ctx, ch, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)
 			return err
 		}
@@ -335,8 +461,8 @@ func (c *Client[E]) bindRegisteredHandlers(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client[E]) createTopicExchanges(ctx context.Context) error {
-	if err := c.createTopicExchange(c.setup.exchangeName); err != nil {
+func (c *Client[E]) createTopicExchanges(ctx context.Context, ch *amqp091.Channel) error {
+	if err := c.createTopicExchange(ch, c.setup.exchangeName); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create topic exchange", "error", err)
 		return err
 	}
@@ -346,18 +472,18 @@ func (c *Client[E]) createTopicExchanges(ctx context.Context) error {
 	}
 
 	// Exchange the retry queue dead-letters back into, owned by this consumer.
-	if err := c.createTopicExchange(c.setup.queueName); err != nil {
+	if err := c.createTopicExchange(ch, c.setup.queueName); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create consumer exchange", "error", err)
 		return err
 	}
 
-	if err := c.createTopicExchange(c.setup.dlqName); err != nil {
+	if err := c.createTopicExchange(ch, c.setup.dlqName); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create dlq exchange", "error", err)
 		return err
 	}
 
 	if c.setup.withRetry {
-		if err := c.createTopicExchange(c.setup.retryName); err != nil {
+		if err := c.createTopicExchange(ch, c.setup.retryName); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to create retry exchange", "error", err)
 			return err
 		}
@@ -366,14 +492,14 @@ func (c *Client[E]) createTopicExchanges(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client[E]) createQueues(ctx context.Context) error {
-	if err := c.createQueue(c.setup.dlqName, nil); err != nil {
+func (c *Client[E]) createQueues(ctx context.Context, ch *amqp091.Channel) error {
+	if err := c.createQueue(ch, c.setup.dlqName, nil); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create dlq queue", "error", err)
 		return err
 	}
 
 	args := amqp091.Table{"x-dead-letter-exchange": c.setup.dlqName}
-	if err := c.createQueue(c.setup.queueName, args); err != nil {
+	if err := c.createQueue(ch, c.setup.queueName, args); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to create queue", "error", err)
 		return err
 	}
@@ -386,7 +512,7 @@ func (c *Client[E]) createQueues(ctx context.Context) error {
 			"x-message-ttl":          int(c.setup.retryInterval.Milliseconds()),
 		}
 
-		if err := c.createQueue(c.setup.retryName, retryArgs); err != nil {
+		if err := c.createQueue(ch, c.setup.retryName, retryArgs); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to create retry queue", "error", err)
 			return err
 		}
@@ -395,22 +521,22 @@ func (c *Client[E]) createQueues(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client[E]) bindQueues(ctx context.Context) error {
+func (c *Client[E]) bindQueues(ctx context.Context, ch *amqp091.Channel) error {
 	// "#" is the AMQP wildcard: these queues take every routing key, which is
 	// what lets a republished message keep the routing key it was published
 	// with instead of being flattened to an empty one.
-	if err := c.bindQueueToExchange(ctx, c.setup.dlqName, "#", c.setup.dlqName, false); err != nil {
+	if err := c.bindQueueToExchange(ctx, ch, c.setup.dlqName, "#", c.setup.dlqName, false); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to bind dlq queue", "error", err)
 		return err
 	}
 
-	if err := c.bindQueueToExchange(ctx, c.setup.queueName, "#", c.setup.queueName, false); err != nil {
+	if err := c.bindQueueToExchange(ctx, ch, c.setup.queueName, "#", c.setup.queueName, false); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to bind queue", "error", err)
 		return err
 	}
 
 	if c.setup.withRetry {
-		if err := c.bindQueueToExchange(ctx, c.setup.retryName, "#", c.setup.retryName, false); err != nil {
+		if err := c.bindQueueToExchange(ctx, ch, c.setup.retryName, "#", c.setup.retryName, false); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to bind retry queue", "error", err)
 			return err
 		}
@@ -419,48 +545,83 @@ func (c *Client[E]) bindQueues(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client[E]) createTopicExchange(exchange string) error {
-	return c.ch.ExchangeDeclare(exchange, "topic", true, false, false, false, nil)
+func (c *Client[E]) createTopicExchange(ch *amqp091.Channel, exchange string) error {
+	return ch.ExchangeDeclare(exchange, "topic", true, false, false, false, nil)
 }
 
-func (c *Client[E]) createQueue(queue string, args amqp091.Table) error {
-	_, err := c.ch.QueueDeclare(queue, true, false, false, false, args)
+func (c *Client[E]) createQueue(ch *amqp091.Channel, queue string, args amqp091.Table) error {
+	_, err := ch.QueueDeclare(queue, true, false, false, false, args)
 	return err
 }
 
 // bindQueueToExchange binds a queue to an exchange. tryCreateExchange declares
 // the exchange first, needed when this consumer is not its owner and the owning
 // application may not have started yet.
-func (c *Client[E]) bindQueueToExchange(ctx context.Context, exchange, routingKey, queueName string, tryCreateExchange bool) error {
+func (c *Client[E]) bindQueueToExchange(ctx context.Context, ch *amqp091.Channel, exchange, routingKey, queueName string, tryCreateExchange bool) error {
 	if tryCreateExchange {
-		if err := c.createTopicExchange(exchange); err != nil {
+		if err := c.createTopicExchange(ch, exchange); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to create topic exchange", "error", err)
 			return err
 		}
 	}
 
-	return c.ch.QueueBind(queueName, routingKey, exchange, false, nil)
+	return ch.QueueBind(queueName, routingKey, exchange, false, nil)
 }
 
-// channel guards the channel pointer, which a reconnection may swap while a
-// publisher or a consumer is using it.
-func (c *Client[E]) channel() (*amqp091.Channel, error) {
+func (c *Client[E]) cancelConsumer() {
+	if !c.setup.isConsumer {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.ch == nil {
-		return nil, errors.New("gorabbit: not connected")
+	// Not live(): a client marked disconnected can still hold the socket the
+	// consume loop is parked on, and only the broker's cancel releases it.
+	if c.ch == nil || c.conn == nil || c.conn.IsClosed() {
+		return
 	}
 
-	return c.ch, nil
+	if err := c.ch.Cancel(c.setup.appName, false); err != nil {
+		c.setup.logger.Error(context.Background(), "gorabbit: error cancelling the consumer", "error", err)
+	}
 }
 
+func (c *Client[E]) waitForConsumer() {
+	drained := make(chan struct{})
+	go func() {
+		c.consumerWg.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+	case <-time.After(closeDrainTimeout):
+		c.setup.logger.Error(context.Background(), "gorabbit: closing while a handler is still running")
+	}
+}
+
+// withConsumerChannel serializes the consumer's control methods: amqp091 does
+// not, so two in-flight rpc calls on one channel can take each other's reply.
+func (c *Client[E]) withConsumerChannel(fn func(*amqp091.Channel) error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.live() || c.ch == nil {
+		return errNotConnected
+	}
+
+	return fn(c.ch)
+}
+
+// publishChannel guards the channel pointer, which a reconnection may swap
+// while a publisher is using it.
 func (c *Client[E]) publishChannel() (*amqp091.Channel, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.live() || c.pubCh == nil {
-		return nil, errors.New("gorabbit: not connected")
+		return nil, errNotConnected
 	}
 
 	return c.pubCh, nil
@@ -483,6 +644,71 @@ func (c *Client[E]) live() bool {
 	return c.isConnected && c.conn != nil && !c.conn.IsClosed()
 }
 
+// A dial that never lands says nothing about the topology — refused credentials
+// and an unknown vhost also answer 403 — so caching is the right answer to it.
+func (c *Client[E]) failedDial(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.setupErr = nil
+
+	return err
+}
+
+// failedSetup tells a topology the broker refuses — which every retry meets
+// again — apart from losing the connection midway, which caching answers.
+func (c *Client[E]) failedSetup(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if rejectedTopology(err) {
+		c.setupErr = fmt.Errorf("%w: %w", ErrTopologyRejected, err)
+		return c.setupErr
+	}
+
+	c.setupErr = nil
+
+	return err
+}
+
+// pendingErr answers whoever skipped the dial: a rejected topology is the
+// caller's answer, an outage is not — the dial in flight may still land.
+func (c *Client[E]) pendingErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.setupErr != nil {
+		return c.setupErr
+	}
+
+	return errDialInProgress
+}
+
+// A soft channel error from the declaration phase answers a topology the broker
+// will not accept, unlike a connection lost while it was being applied.
+func rejectedTopology(err error) bool {
+	var amqpErr *amqp091.Error
+	if !errors.As(err, &amqpErr) {
+		return false
+	}
+
+	switch amqpErr.Code {
+	case amqp091.AccessRefused, amqp091.NotFound, amqp091.ResourceLocked, amqp091.PreconditionFailed:
+		return true
+	}
+
+	return false
+}
+
+func (c *Client[E]) closed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // bindHandler binds now when connected; while disconnected the binding is
 // applied by the next successful connection.
 func (c *Client[E]) bindHandler(ctx context.Context, hi handlerInfo) {
@@ -493,7 +719,7 @@ func (c *Client[E]) bindHandler(ctx context.Context, hi handlerInfo) {
 		return
 	}
 
-	if err := c.bindQueueToExchange(ctx, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
+	if err := c.bindQueueToExchange(ctx, c.ch, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
 		// A failed bind closes the channel; dropping the connected state makes
 		// the reconnect loop rebuild it and re-bind every registered handler.
 		c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)

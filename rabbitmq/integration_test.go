@@ -222,7 +222,7 @@ func TestIntegrationCachedMessagesAreFlushedOnConnect(t *testing.T) {
 		}
 	}
 
-	keys, err := cache.GetAllKeys(ctx, cacheKey("cached-producer", 0)+"*")
+	keys, err := cache.GetAllKeys(ctx, cacheKey("cached-producer", "")+"*")
 	require.NoError(t, err)
 	require.Empty(t, keys, "published messages must leave the cache")
 }

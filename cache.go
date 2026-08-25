@@ -39,6 +39,8 @@ func (c *memoryCache) Set(_ context.Context, key string, data []byte, ttl time.D
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.evictExpired()
+
 	entry := memoryEntry{data: data}
 	if ttl > 0 {
 		entry.expiresAt = time.Now().Add(ttl)
@@ -61,12 +63,14 @@ func (c *memoryCache) Get(_ context.Context, key string) ([]byte, error) {
 }
 
 func (c *memoryCache) GetAllKeys(_ context.Context, pattern string) ([]string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.evictExpired()
 
 	var keys []string
-	for key, entry := range c.entries {
-		if !entry.expired() && globMatch(pattern, key) {
+	for key := range c.entries {
+		if globMatch(pattern, key) {
 			keys = append(keys, key)
 		}
 	}
@@ -83,6 +87,16 @@ func (c *memoryCache) Delete(_ context.Context, keys ...string) error {
 	}
 
 	return nil
+}
+
+// Nothing owns a background sweeper here, so expired entries are dropped on the
+// writes that already walk the map. Caller holds the write lock.
+func (c *memoryCache) evictExpired() {
+	for key, entry := range c.entries {
+		if entry.expired() {
+			delete(c.entries, key)
+		}
+	}
 }
 
 func (e memoryEntry) expired() bool {

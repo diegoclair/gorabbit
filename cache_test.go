@@ -42,6 +42,40 @@ func TestMemoryCache(t *testing.T) {
 		require.Empty(t, keys)
 	})
 
+	t.Run("an expired entry leaves the map behind", func(t *testing.T) {
+		c := NewMemoryCache()
+		entries := c.(*memoryCache)
+		require.NoError(t, c.Set(ctx, "expiring", []byte("value"), 10*time.Millisecond))
+
+		require.Eventually(t, func() bool {
+			keys, err := c.GetAllKeys(ctx, "*")
+			if err != nil || len(keys) > 0 {
+				return false
+			}
+
+			entries.mu.RLock()
+			defer entries.mu.RUnlock()
+			return len(entries.entries) == 0
+		}, time.Second, 10*time.Millisecond, "reading around the expired entry leaks it")
+	})
+
+	t.Run("a write evicts what expired before it", func(t *testing.T) {
+		c := NewMemoryCache()
+		entries := c.(*memoryCache)
+		require.NoError(t, c.Set(ctx, "expiring", []byte("value"), 10*time.Millisecond))
+
+		require.Eventually(t, func() bool {
+			if err := c.Set(ctx, "kept", []byte("value"), 0); err != nil {
+				return false
+			}
+
+			entries.mu.RLock()
+			defer entries.mu.RUnlock()
+			_, stale := entries.entries["expiring"]
+			return !stale && len(entries.entries) == 1
+		}, time.Second, 10*time.Millisecond, "writing around the expired entry leaks it")
+	})
+
 	t.Run("get all keys filters by pattern", func(t *testing.T) {
 		c := NewMemoryCache()
 		require.NoError(t, c.Set(ctx, "gorabbit:cached:app:1", nil, 0))

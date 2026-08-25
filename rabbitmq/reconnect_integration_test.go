@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -468,4 +470,161 @@ func TestReconnectPublishOnlyClientSurvivesBrokerRestart(t *testing.T) {
 
 	requireExactlyOnce(t, received, expectedIDs("down", n))
 	require.Eventually(t, producer.Connected, reconnectWait, 100*time.Millisecond)
+}
+
+type confirmExchange struct{}
+
+func (confirmExchange) Name() string { return "confirm-events" }
+
+type confirmEvent struct {
+	gorabbit.Msg[confirmExchange]
+	ID string `json:"id"`
+}
+
+// brokerProxy exists to reach the window between the write of a publish and its
+// confirm: it holds the bytes back and then tears the connection down.
+type brokerProxy struct {
+	listener   net.Listener
+	target     string
+	blocked    atomic.Bool
+	clientSent chan struct{}
+	mu         sync.Mutex
+	conns      []net.Conn
+}
+
+func newBrokerProxy(t *testing.T, target string) *brokerProxy {
+	t.Helper()
+
+	u, err := url.Parse(target)
+	require.NoError(t, err)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	p := &brokerProxy{listener: listener, target: u.Host, clientSent: make(chan struct{}, 1)}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		p.cut()
+	})
+
+	go p.accept()
+
+	return p
+}
+
+func (p *brokerProxy) url() string {
+	return fmt.Sprintf("amqp://guest:guest@%s/", p.listener.Addr().String())
+}
+
+func (p *brokerProxy) accept() {
+	for {
+		client, err := p.listener.Accept()
+		if err != nil {
+			return
+		}
+
+		broker, err := net.Dial("tcp", p.target)
+		if err != nil {
+			_ = client.Close()
+			continue
+		}
+
+		p.mu.Lock()
+		p.conns = append(p.conns, client, broker)
+		p.mu.Unlock()
+
+		go p.pipe(broker, client, true)
+		go p.pipe(client, broker, false)
+	}
+}
+
+func (p *brokerProxy) pipe(dst, src net.Conn, fromClient bool) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if p.blocked.Load() {
+				// A heartbeat is 8 bytes; anything larger is the publish.
+				if fromClient && n > 32 {
+					select {
+					case p.clientSent <- struct{}{}:
+					default:
+					}
+				}
+			} else if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (p *brokerProxy) block()   { p.blocked.Store(true) }
+func (p *brokerProxy) unblock() { p.blocked.Store(false) }
+
+func (p *brokerProxy) cut() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, conn := range p.conns {
+		_ = conn.Close()
+	}
+	p.conns = nil
+}
+
+func TestReconnectPublishTornDownBeforeItsConfirmIsNotLost(t *testing.T) {
+	skipWithoutBroker(t)
+
+	ctx := context.Background()
+	cache := gorabbit.NewMemoryCache()
+	received := make(chan string, 4)
+
+	consumer := newConsumer[confirmExchange](t, "confirm-queue")
+	require.NoError(t, RegisterHandler(ctx, consumer, confirmEvent{},
+		func(_ context.Context, msg confirmEvent) error {
+			received <- msg.ID
+			return nil
+		}))
+	consumer.Start(ctx)
+
+	proxy := newBrokerProxy(t, brokerURL)
+	producer, err := NewSetup[confirmExchange](proxy.url(), "confirm-producer").
+		WithDialTimeout(testDialTimeout).
+		WithReconnectDelay(testReconnectWait).
+		Connect(cache)
+	require.NoError(t, err)
+	t.Cleanup(producer.Close)
+	require.True(t, producer.Connected())
+
+	proxy.block()
+	published := make(chan error, 1)
+	go func() { published <- producer.Publish(ctx, confirmEvent{ID: "unconfirmed-0"}) }()
+
+	select {
+	case <-proxy.clientSent:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the publish never reached the wire")
+	}
+	proxy.cut()
+
+	select {
+	case err := <-published:
+		require.NoError(t, err)
+	case <-time.After(reconnectWait):
+		t.Fatal("Publish did not return after the connection was torn down")
+	}
+
+	keys, err := cache.GetAllKeys(ctx, cacheKey("confirm-producer", "")+"*")
+	require.NoError(t, err)
+	require.Len(t, keys, 1, "a publish the broker never confirmed must stay in the cache")
+
+	proxy.unblock()
+
+	requireExactlyOnce(t, received, expectedIDs("unconfirmed", 1))
+	require.Eventually(t, func() bool {
+		keys, err := cache.GetAllKeys(ctx, cacheKey("confirm-producer", "")+"*")
+		return err == nil && len(keys) == 0
+	}, reconnectWait, 100*time.Millisecond, "a delivered message must leave the cache")
 }

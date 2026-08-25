@@ -3,8 +3,8 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"maps"
-	"time"
 	"uuid"
 
 	"github.com/diegoclair/gorabbit"
@@ -12,6 +12,12 @@ import (
 )
 
 const retryCountHeaderKey = "x-retry-count"
+
+var (
+	errNotConfirmed = errors.New("gorabbit: message was not confirmed by the broker")
+	// The type name is the routing key, so an unnamed type can match no binding.
+	errEmptyTypeName = errors.New("gorabbit: message type has no name, use a named struct")
+)
 
 type publishMessage struct {
 	MsgID       string
@@ -26,7 +32,6 @@ func (pm *publishMessage) toCacheMessage() cachedMessage {
 		MsgTypeName: pm.MsgTypeName,
 		Message:     pm.MsgBody,
 		MsgHeaders:  pm.MsgHeaders,
-		Timestamp:   time.Now(),
 	}
 }
 
@@ -75,9 +80,18 @@ func (c *Client[E]) Publish(ctx context.Context, msg gorabbit.OwnedBy[E]) error 
 		return err
 	}
 
+	if pm.MsgTypeName == "" {
+		c.setup.logger.Error(ctx, "gorabbit: error to publish message", "error", errEmptyTypeName)
+		return errEmptyTypeName
+	}
+
 	if !c.connected() {
 		c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect before publishing")
 		if err := c.reconnect(ctx); err != nil {
+			if errors.Is(err, ErrClientClosed) || errors.Is(err, ErrTopologyRejected) {
+				return err
+			}
+
 			c.setup.logger.Error(ctx, "gorabbit: failed to reconnect, caching message", "error", err)
 			return c.cacheMessage(ctx, pm)
 		}
@@ -92,29 +106,52 @@ func (c *Client[E]) Publish(ctx context.Context, msg gorabbit.OwnedBy[E]) error 
 }
 
 func (c *Client[E]) publish(ctx context.Context, pm *publishMessage) error {
+	err := c.publishConfirmed(ctx, c.setup.exchangeName, pm.MsgTypeName, amqp091.Publishing{
+		ContentType:  "application/json",
+		MessageId:    pm.MsgID,
+		Type:         pm.MsgTypeName,
+		Body:         pm.MsgBody,
+		DeliveryMode: amqp091.Persistent,
+		Headers:      pm.MsgHeaders,
+	})
+	if err != nil {
+		c.setup.logger.Error(ctx, "gorabbit: error to publish message", "message_type", pm.MsgTypeName, "error", err)
+		return err
+	}
+
+	return nil
+}
+
+// Callers drop their own copy of the message on success, so a nil error must
+// mean the broker owns it.
+func (c *Client[E]) publishConfirmed(ctx context.Context, exchange, routingKey string, msg amqp091.Publishing) error {
 	ch, err := c.publishChannel()
 	if err != nil {
 		return err
 	}
 
-	err = ch.Publish(
-		c.setup.exchangeName,
-		pm.MsgTypeName, // routing key is always the message type
-		false,          // mandatory
-		false,          // immediate
-		amqp091.Publishing{
-			ContentType:  "application/json",
-			MessageId:    pm.MsgID,
-			Type:         pm.MsgTypeName,
-			Body:         pm.MsgBody,
-			DeliveryMode: amqp091.Persistent,
-			Headers:      pm.MsgHeaders,
-		},
-	)
+	confirmation, err := ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, false, false, msg)
 	if err != nil {
-		c.setup.logger.Error(ctx, "gorabbit: error to publish message", "message_type", pm.MsgTypeName, "error", err)
-		c.setConnected(false)
+		// A caller giving up says nothing about the socket, and dropping the
+		// state here would tear a healthy connection down.
+		if ctx.Err() == nil {
+			c.setConnected(false)
+		}
 		return err
+	}
+	if confirmation == nil {
+		return errNotConfirmed
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, c.setup.confirmTimeout)
+	defer cancel()
+
+	acked, err := confirmation.WaitContext(waitCtx)
+	if err != nil {
+		return err
+	}
+	if !acked {
+		return errNotConfirmed
 	}
 
 	return nil

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/diegoclair/gorabbit"
@@ -27,7 +28,6 @@ type cachedMessage struct {
 	MsgTypeName string
 	Message     []byte
 	MsgHeaders  amqp091.Table
-	Timestamp   time.Time
 }
 
 func (c *Client[E]) cacheMessage(ctx context.Context, pm *publishMessage) error {
@@ -39,7 +39,7 @@ func (c *Client[E]) cacheMessage(ctx context.Context, pm *publishMessage) error 
 		return err
 	}
 
-	key := cacheKey(c.setup.appName, cachedMsg.Timestamp.UnixNano())
+	key := cacheKey(c.setup.appName, cachedMsg.MsgID)
 	if err := c.cache.Set(ctx, key, jsonMsg, cachedMessageTTL); err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to cache message", "error", err)
 		return err
@@ -58,6 +58,13 @@ func (c *Client[E]) flushCachedMessages(ctx context.Context) {
 		return
 	}
 
+	// A message leaves the cache only once it is published, so two flushes
+	// racing over the same snapshot publish it twice.
+	if !c.flushing.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.flushing.Store(false)
+
 	messages, err := c.getMessagesFromCache(ctx)
 	if err != nil || len(messages) == 0 {
 		return
@@ -72,7 +79,7 @@ func (c *Client[E]) flushCachedMessages(ctx context.Context) {
 			return
 		}
 
-		key := cacheKey(c.setup.appName, msg.Timestamp.UnixNano())
+		key := cacheKey(c.setup.appName, msg.MsgID)
 		if err := c.cache.Delete(ctx, key); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error deleting cached message", "error", err)
 		}
@@ -80,7 +87,7 @@ func (c *Client[E]) flushCachedMessages(ctx context.Context) {
 }
 
 func (c *Client[E]) getMessagesFromCache(ctx context.Context) ([]cachedMessage, error) {
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.setup.appName, 0)+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.setup.appName, "")+"*")
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error retrieving cached message keys", "error", err)
 		return nil, err
@@ -106,21 +113,18 @@ func (c *Client[E]) getMessagesFromCache(ctx context.Context) ([]cachedMessage, 
 		messages = append(messages, cachedMsg)
 	}
 
-	// Publish in the order the messages were cached.
+	// Replay in publish order: the id is a UUIDv7, so it already sorts by time.
 	slices.SortFunc(messages, func(a, b cachedMessage) int {
-		return a.Timestamp.Compare(b.Timestamp)
+		return strings.Compare(a.MsgID, b.MsgID)
 	})
 
 	return messages, nil
 }
 
-func cacheKey(appName string, timestamp int64) string {
-	key := fmt.Sprintf("%s:%s:", cachedMessagePrefix, appName)
-	if timestamp > 0 {
-		key = fmt.Sprintf("%s%d", key, timestamp)
-	}
-
-	return key
+// The message id keys the entry: a timestamp collides whenever two messages
+// share an instant, and the loser is overwritten.
+func cacheKey(appName, msgID string) string {
+	return fmt.Sprintf("%s:%s:%s", cachedMessagePrefix, appName, msgID)
 }
 
 // errNilMessage guards the typed nil: it marshals to "null" and panics on the
@@ -178,7 +182,10 @@ func (c *Client[E]) monitorConnection(ctx context.Context) {
 
 			c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect")
 			if err := c.reconnect(ctx); err != nil {
-				c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", "error", err)
+				// The dial already in flight is the one that will heal it.
+				if !errors.Is(err, errDialInProgress) {
+					c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", "error", err)
+				}
 				continue
 			}
 
@@ -190,8 +197,15 @@ func (c *Client[E]) monitorConnection(ctx context.Context) {
 // reconnect delivers whatever the cache holds as soon as the connection lands;
 // every path that connects goes through it so no flush is missed.
 func (c *Client[E]) reconnect(ctx context.Context) error {
-	if err := c.connect(ctx); err != nil {
+	established, err := c.connect(ctx)
+	if err != nil {
 		return err
+	}
+
+	// A caller that found the connection already up did not bring it back, and
+	// flushing from there only adds contenders to the one flush that matters.
+	if !established {
+		return nil
 	}
 
 	c.flushCachedMessages(ctx)

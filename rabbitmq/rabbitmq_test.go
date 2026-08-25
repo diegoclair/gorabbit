@@ -100,6 +100,11 @@ func TestSetupValidate(t *testing.T) {
 			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(3, 0, nil),
 			wantErr: "retry interval must be greater than zero",
 		},
+		{
+			name:    "publish confirm timeout not greater than zero",
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithPublishConfirmTimeout(0),
+			wantErr: "publish confirm timeout must be greater than zero",
+		},
 	}
 
 	for _, tt := range tests {
@@ -121,7 +126,8 @@ func TestSetupBuilders(t *testing.T) {
 		WithConsumer("app-queue").
 		WithRetry(5, 2*time.Second, retryable).
 		WithPrefetchCount(10).
-		WithReconnectDelay(time.Minute)
+		WithReconnectDelay(time.Minute).
+		WithPublishConfirmTimeout(3 * time.Second)
 
 	require.True(t, s.isConsumer)
 	require.Equal(t, "app-queue", s.queueName)
@@ -133,6 +139,7 @@ func TestSetupBuilders(t *testing.T) {
 	require.NotNil(t, s.retryableErrorFunc)
 	require.Equal(t, 10, s.preFetchCount)
 	require.Equal(t, time.Minute, s.reconnectDelay)
+	require.Equal(t, 3*time.Second, s.confirmTimeout)
 }
 
 func TestSetupOptionalDependenciesKeepDefaults(t *testing.T) {
@@ -144,6 +151,7 @@ func TestSetupOptionalDependenciesKeepDefaults(t *testing.T) {
 	require.NotNil(t, s.logger)
 	require.NotNil(t, s.headers)
 	require.Equal(t, defaultReconnectDelay, s.reconnectDelay)
+	require.Equal(t, defaultPublishConfirmTimeout, s.confirmTimeout)
 }
 
 func TestConnectRequiresCache(t *testing.T) {
@@ -175,7 +183,7 @@ func TestConnectWithUnreachableBrokerReturnsUsableClient(t *testing.T) {
 	require.False(t, c.Connected())
 
 	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "1"}))
-	keys, err := cache.GetAllKeys(ctx, cacheKey("app", 0)+"*")
+	keys, err := cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1, "an offline publish must land in the cache")
 
@@ -268,7 +276,7 @@ func TestPublishRejectsANilMessage(t *testing.T) {
 
 	require.ErrorContains(t, c.Publish(ctx, (*orderCreated)(nil)), "message is nil")
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", 0)+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
 	require.NoError(t, err)
 	require.Empty(t, keys, "an unpublishable message must not reach the cache")
 }
@@ -361,8 +369,8 @@ func TestStampOriginExchange(t *testing.T) {
 }
 
 func TestCacheKey(t *testing.T) {
-	require.Equal(t, "gorabbit:cached_messages:app:", cacheKey("app", 0))
-	require.Equal(t, "gorabbit:cached_messages:app:42", cacheKey("app", 42))
+	require.Equal(t, "gorabbit:cached_messages:app:", cacheKey("app", ""))
+	require.Equal(t, "gorabbit:cached_messages:app:0198b7ff", cacheKey("app", "0198b7ff"))
 }
 
 func TestHandlerKeys(t *testing.T) {
@@ -379,7 +387,7 @@ func TestPublishCachesMessageWhenBrokerIsUnreachable(t *testing.T) {
 
 	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "123"}))
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", 0)+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 
@@ -432,30 +440,34 @@ func TestFlushCachedMessagesIsANoopWhileDisconnected(t *testing.T) {
 	// No channel is open, so a flush that did not check the connection would panic.
 	c.flushCachedMessages(ctx)
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", 0)+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 }
 
-func TestGetMessagesFromCacheSortsByTimestampAndSkipsCorruptEntries(t *testing.T) {
+func TestGetMessagesFromCacheReplaysInPublishOrderAndSkipsCorruptEntries(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 
-	newest := cachedMessage{MsgTypeName: "newest", Timestamp: time.Now()}
-	oldest := cachedMessage{MsgTypeName: "oldest", Timestamp: time.Now().Add(-time.Hour)}
-
-	for _, msg := range []cachedMessage{newest, oldest} {
+	// Stored out of order so the sort, not the insertion, is what is proven.
+	first, second, third := uuid.NewV7().String(), uuid.NewV7().String(), uuid.NewV7().String()
+	for _, msg := range []cachedMessage{
+		{MsgID: third, MsgTypeName: "third"},
+		{MsgID: first, MsgTypeName: "first"},
+		{MsgID: second, MsgTypeName: "second"},
+	} {
 		data, err := json.Marshal(msg)
 		require.NoError(t, err)
-		require.NoError(t, c.cache.Set(ctx, cacheKey("app", msg.Timestamp.UnixNano()), data, 0))
+		require.NoError(t, c.cache.Set(ctx, cacheKey("app", msg.MsgID), data, 0))
 	}
-	require.NoError(t, c.cache.Set(ctx, cacheKey("app", 1), []byte("not json"), 0))
+	require.NoError(t, c.cache.Set(ctx, cacheKey("app", "corrupt"), []byte("not json"), 0))
 
 	messages, err := c.getMessagesFromCache(ctx)
 	require.NoError(t, err)
-	require.Len(t, messages, 2)
-	require.Equal(t, "oldest", messages[0].MsgTypeName)
-	require.Equal(t, "newest", messages[1].MsgTypeName)
+	require.Len(t, messages, 3)
+	require.Equal(t, "first", messages[0].MsgTypeName)
+	require.Equal(t, "second", messages[1].MsgTypeName)
+	require.Equal(t, "third", messages[2].MsgTypeName)
 }
 
 func TestRetryCountHeader(t *testing.T) {
