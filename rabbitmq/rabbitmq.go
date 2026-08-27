@@ -215,6 +215,12 @@ func newClient[E gorabbit.Exchange](setup *Setup[E], cache gorabbit.Cache) *Clie
 	}
 }
 
+// Tells apart the connection-lifecycle lines of the several clients one process
+// may hold.
+func (c *Client[E]) connFields(keyvals ...any) []any {
+	return append([]any{"app_name", c.setup.appName, "exchange", c.setup.exchangeName}, keyvals...)
+}
+
 // Connect validates the setup and returns a usable Client. An error means the
 // setup is invalid, the cache is missing or the broker rejected the topology —
 // a broker outage is a state, not an error: the client then starts
@@ -240,12 +246,12 @@ func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 		// Only a deploy fixes a refused topology, so it must stop the boot
 		// instead of leaving a client that can never publish.
 		if errors.Is(err, ErrTopologyRejected) {
-			c.setup.logger.Error(ctx, "gorabbit: broker rejected the topology", "error", err)
+			c.setup.logger.Error(ctx, "gorabbit: broker rejected the topology", c.connFields("error", err)...)
 			c.Close()
 			return nil, err
 		}
 
-		c.setup.logger.Warn(ctx, "gorabbit: broker unreachable, starting disconnected", "error", err)
+		c.setup.logger.Warn(ctx, "gorabbit: broker unreachable, starting disconnected", c.connFields("error", err)...)
 	}
 
 	// Started here, not in Start: a publish-only client must also heal.
@@ -278,7 +284,7 @@ func (c *Client[E]) connect(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	c.setup.logger.Info(ctx, "gorabbit: connecting to RabbitMQ")
+	c.setup.logger.Info(ctx, "gorabbit: connecting to RabbitMQ", c.connFields()...)
 	c.dropConnection()
 
 	bc, err := c.dial(ctx)
@@ -291,7 +297,7 @@ func (c *Client[E]) connect(ctx context.Context) (bool, error) {
 		return false, c.failedSetup(err)
 	}
 
-	c.setup.logger.Info(ctx, "gorabbit: connected to RabbitMQ")
+	c.setup.logger.Info(ctx, "gorabbit: connected to RabbitMQ", c.connFields()...)
 
 	return true, nil
 }
@@ -308,7 +314,7 @@ func (c *Client[E]) dial(ctx context.Context) (*brokerConn, error) {
 
 	conn, err := amqp091.DialConfig(c.setup.amqpURL, cfg)
 	if err != nil {
-		c.setup.logger.Error(ctx, "gorabbit: error to dial amqp", "error", err)
+		c.setup.logger.Error(ctx, "gorabbit: error to dial amqp", c.connFields("error", err)...)
 		return nil, err
 	}
 
@@ -316,14 +322,14 @@ func (c *Client[E]) dial(ctx context.Context) (*brokerConn, error) {
 
 	bc.ch, err = conn.Channel()
 	if err != nil {
-		c.setup.logger.Error(ctx, "gorabbit: error to open channel", "error", err)
+		c.setup.logger.Error(ctx, "gorabbit: error to open channel", c.connFields("error", err)...)
 		_ = conn.Close()
 		return nil, err
 	}
 
 	bc.pubCh, err = conn.Channel()
 	if err != nil {
-		c.setup.logger.Error(ctx, "gorabbit: error to open publish channel", "error", err)
+		c.setup.logger.Error(ctx, "gorabbit: error to open publish channel", c.connFields("error", err)...)
 		_ = conn.Close()
 		return nil, err
 	}
@@ -331,14 +337,14 @@ func (c *Client[E]) dial(ctx context.Context) (*brokerConn, error) {
 	// Without confirms the broker never answers a publish, so a message lost
 	// between the socket and the queue would look delivered.
 	if err = bc.pubCh.Confirm(false); err != nil {
-		c.setup.logger.Error(ctx, "gorabbit: error to put the publish channel in confirm mode", "error", err)
+		c.setup.logger.Error(ctx, "gorabbit: error to put the publish channel in confirm mode", c.connFields("error", err)...)
 		_ = conn.Close()
 		return nil, err
 	}
 
 	if c.setup.isConsumer && c.setup.preFetchCount > 0 {
 		if err = bc.ch.Qos(c.setup.preFetchCount, 0, false); err != nil {
-			c.setup.logger.Error(ctx, "gorabbit: error to set prefetch count", "error", err)
+			c.setup.logger.Error(ctx, "gorabbit: error to set prefetch count", c.connFields("error", err)...)
 			_ = conn.Close()
 			return nil, err
 		}
@@ -413,13 +419,13 @@ func (c *Client[E]) Close() {
 				continue
 			}
 			if err := ch.Close(); err != nil {
-				c.setup.logger.Error(context.Background(), "gorabbit: error closing channel", "error", err)
+				c.setup.logger.Error(context.Background(), "gorabbit: error closing channel", c.connFields("error", err)...)
 			}
 		}
 
 		if c.conn != nil {
 			if err := c.conn.Close(); err != nil {
-				c.setup.logger.Error(context.Background(), "gorabbit: error closing connection", "error", err)
+				c.setup.logger.Error(context.Background(), "gorabbit: error closing connection", c.connFields("error", err)...)
 			}
 		}
 
@@ -583,7 +589,7 @@ func (c *Client[E]) cancelConsumer() {
 	}
 
 	if err := c.ch.Cancel(c.setup.appName, false); err != nil {
-		c.setup.logger.Error(context.Background(), "gorabbit: error cancelling the consumer", "error", err)
+		c.setup.logger.Error(context.Background(), "gorabbit: error cancelling the consumer", c.connFields("error", err)...)
 	}
 }
 
@@ -597,7 +603,7 @@ func (c *Client[E]) waitForConsumer() {
 	select {
 	case <-drained:
 	case <-time.After(closeDrainTimeout):
-		c.setup.logger.Error(context.Background(), "gorabbit: closing while a handler is still running")
+		c.setup.logger.Error(context.Background(), "gorabbit: closing while a handler is still running", c.connFields()...)
 	}
 }
 

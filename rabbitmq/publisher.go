@@ -86,13 +86,13 @@ func (c *Client[E]) Publish(ctx context.Context, msg gorabbit.OwnedBy[E]) error 
 	}
 
 	if !c.connected() {
-		c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect before publishing")
+		c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect before publishing", c.connFields()...)
 		if err := c.reconnect(ctx); err != nil {
 			if errors.Is(err, ErrClientClosed) || errors.Is(err, ErrTopologyRejected) {
 				return err
 			}
 
-			c.setup.logger.Error(ctx, "gorabbit: failed to reconnect, caching message", "error", err)
+			c.setup.logger.Error(ctx, "gorabbit: failed to reconnect, caching message", c.connFields("error", err)...)
 			return c.cacheMessage(ctx, pm)
 		}
 	}

@@ -180,16 +180,16 @@ func (c *Client[E]) monitorConnection(ctx context.Context) {
 				continue
 			}
 
-			c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect")
+			c.setup.logger.Info(ctx, "gorabbit: not connected, attempting to reconnect", c.connFields()...)
 			if err := c.reconnect(ctx); err != nil {
 				// The dial already in flight is the one that will heal it.
 				if !errors.Is(err, errDialInProgress) {
-					c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", "error", err)
+					c.setup.logger.Error(ctx, "gorabbit: failed to reconnect", c.connFields("error", err)...)
 				}
 				continue
 			}
 
-			c.setup.logger.Info(ctx, "gorabbit: reconnected")
+			c.setup.logger.Info(ctx, "gorabbit: reconnected", c.connFields()...)
 		}
 	}
 }

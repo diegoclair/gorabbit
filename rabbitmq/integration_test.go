@@ -481,3 +481,39 @@ func consumeOne(t *testing.T, queue string, timeout time.Duration) amqp091.Deliv
 		return amqp091.Delivery{}
 	}
 }
+
+type telemetryExchange struct{}
+
+func (telemetryExchange) Name() string { return "telemetry-events" }
+
+// The connected and consuming lines only happen against a real broker.
+func TestIntegrationConnectAndConsumeLogsIdentifyTheClient(t *testing.T) {
+	skipWithoutBroker(t)
+	t.Parallel()
+
+	ctx := context.Background()
+	logger := &recordingLogger{}
+
+	c, err := NewSetup[telemetryExchange](brokerURL, "telemetry-worker").
+		WithConsumer("telemetry-queue").
+		WithLogger(logger).
+		Connect(gorabbit.NewMemoryCache())
+	require.NoError(t, err)
+	t.Cleanup(c.Close)
+	c.Start(ctx)
+
+	connected, ok := logger.fieldsOf("gorabbit: connected to RabbitMQ")
+	require.True(t, ok, "missing the connected log line")
+	require.Equal(t, "telemetry-worker", connected["app_name"])
+	require.Equal(t, "telemetry-events", connected["exchange"])
+
+	var consuming map[string]any
+	require.Eventually(t, func() bool {
+		consuming, ok = logger.fieldsOf("gorabbit: started consuming messages")
+		return ok
+	}, 10*time.Second, 50*time.Millisecond, "missing the consuming log line")
+
+	require.Equal(t, "telemetry-worker", consuming["app_name"])
+	require.Equal(t, "telemetry-events", consuming["exchange"])
+	require.Equal(t, "telemetry-queue", consuming["queue"])
+}

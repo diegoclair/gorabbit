@@ -236,6 +236,11 @@ type Logger interface {
 }
 ```
 
+Every connection lifecycle line — connecting, connected, dial failure, reconnect,
+close — carries `app_name` and `exchange`, so a process holding one client per
+exchange can tell whose connection a line is about. The consumer's
+`started consuming messages` also carries `queue`.
+
 ## Propagating context (correlation id, user, tenant)
 
 The library does not know your context keys, so it asks you for them:

@@ -142,7 +142,7 @@ func (c *Client[E]) consume(ctx context.Context) {
 			}
 
 			if err := c.consumeMessages(ctx); err != nil {
-				c.setup.logger.Error(ctx, "gorabbit: error consuming messages", "error", err)
+				c.setup.logger.Error(ctx, "gorabbit: error consuming messages", c.connFields("error", err)...)
 				c.setConnected(false)
 			}
 		}
@@ -160,7 +160,7 @@ func (c *Client[E]) consumeMessages(ctx context.Context) error {
 		return fmt.Errorf("gorabbit: failed to start consuming messages: %w", err)
 	}
 
-	c.setup.logger.Info(ctx, "gorabbit: started consuming messages", "queue", c.setup.queueName)
+	c.setup.logger.Info(ctx, "gorabbit: started consuming messages", c.connFields("queue", c.setup.queueName)...)
 
 	for {
 		select {

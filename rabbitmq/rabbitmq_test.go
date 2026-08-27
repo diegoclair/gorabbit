@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 	"uuid"
@@ -582,4 +583,68 @@ func (testCarrier) FromContext(ctx context.Context) map[string]any {
 
 func (testCarrier) ToContext(ctx context.Context, headers map[string]any) context.Context {
 	return context.WithValue(ctx, testCarrierKey, headers["correlation_id"])
+}
+
+// The other test loggers drop the key/values; asserting on fields needs them kept.
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []recordedLine
+}
+
+type recordedLine struct {
+	msg    string
+	fields map[string]any
+}
+
+func (l *recordingLogger) Debug(_ context.Context, msg string, kv ...any) { l.record(msg, kv) }
+func (l *recordingLogger) Info(_ context.Context, msg string, kv ...any)  { l.record(msg, kv) }
+func (l *recordingLogger) Warn(_ context.Context, msg string, kv ...any)  { l.record(msg, kv) }
+func (l *recordingLogger) Error(_ context.Context, msg string, kv ...any) { l.record(msg, kv) }
+
+func (l *recordingLogger) record(msg string, kv []any) {
+	fields := make(map[string]any, len(kv)/2)
+	for i := 0; i+1 < len(kv); i += 2 {
+		if key, ok := kv[i].(string); ok {
+			fields[key] = kv[i+1]
+		}
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, recordedLine{msg: msg, fields: fields})
+}
+
+func (l *recordingLogger) fieldsOf(msg string) (map[string]any, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, line := range l.lines {
+		if line.msg == msg {
+			return line.fields, true
+		}
+	}
+
+	return nil, false
+}
+
+var _ gorabbit.Logger = (*recordingLogger)(nil)
+
+// An application running one client per exchange needs every lifecycle line to
+// say which of them it came from.
+func TestConnectionLifecycleLogsIdentifyTheClient(t *testing.T) {
+	logger := &recordingLogger{}
+	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "orders-api").
+		WithLogger(logger).
+		WithDialTimeout(500 * time.Millisecond))
+	t.Cleanup(c.Close)
+
+	_, err := c.connect(context.Background())
+	require.Error(t, err)
+
+	for _, msg := range []string{"gorabbit: connecting to RabbitMQ", "gorabbit: error to dial amqp"} {
+		fields, ok := logger.fieldsOf(msg)
+		require.True(t, ok, "missing log line %q", msg)
+		require.Equal(t, "orders-api", fields["app_name"], msg)
+		require.Equal(t, "orders", fields["exchange"], msg)
+	}
 }
