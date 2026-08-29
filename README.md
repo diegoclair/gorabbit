@@ -17,8 +17,8 @@
     </a>
 </p>
 
-Publish and consume typed messages over RabbitMQ topic exchanges. Each message
-type is its own routing key, handlers are generic (`func(ctx, OrderCreated) error`),
+Publish and consume typed messages over RabbitMQ topic exchanges. The message
+type decides where it goes, handlers are generic (`func(ctx, OrderCreated) error`),
 and the topology — exchanges, queue, retry queue and dead-letter queue — is
 declared for you on connect.
 
@@ -40,7 +40,7 @@ Requires **Go 1.27+**.
 One package per exchange, shared by the services that publish and consume it: the
 marker names the exchange, the alias is what every message embeds, and the facts
 live next to them. A message therefore carries its own destination — `Publish`
-takes no exchange, and the routing key is the struct's type name.
+takes no exchange.
 
 ```go
 // package orders
@@ -65,6 +65,28 @@ payload: `{"order_id":"123","total":4990}`.
 A struct without a marker is not a `gorabbit.Message` and does not compile — the
 mistake is caught by the compiler, never by the broker.
 
+### Two markers: one way, or the message picks the way
+
+`Msg` is a fact every subscriber of that type receives in full. When the type is
+instead a stream several queues want to split — one per marketplace, per tenant,
+per region — the message itself says which slice it belongs to:
+
+```go
+// package events
+type EventRecorded struct {
+    gorabbit.RoutedMsg[Exchange]
+    Vendor string `json:"vendor"`
+    ID     string `json:"id"`
+}
+
+func (e EventRecorded) RouteBy() string { return e.Vendor }
+```
+
+The two markers promote different methods, so the compiler keeps them apart: a
+struct embedding both is not a `Message` at all, `SubscribeRoute` refuses a `Msg`,
+and a type that embeds `RoutedMsg` and forgets `RouteBy` does not compile where a
+route is subscribed.
+
 ### A service owns one exchange and consumes others
 
 The exchange a service owns is a type parameter of its client, so it is named
@@ -83,7 +105,7 @@ if err != nil {
 defer client.Close()
 
 // Consuming a fact owned by another service.
-err = rabbitmq.RegisterHandler(ctx, client, payments.PaymentConfirmed{},
+err = rabbitmq.Subscribe(ctx, client, payments.PaymentConfirmed{},
     func(ctx context.Context, msg payments.PaymentConfirmed) error {
         return orderService.MarkPaid(ctx, msg.OrderID)
     })
@@ -91,7 +113,17 @@ if err != nil {
     log.Fatal(err)
 }
 
-client.Start(ctx) // call after every handler is registered
+// Consuming one slice of a routed fact: this queue takes the events of one
+// vendor and no other queue receives a copy of them.
+err = rabbitmq.SubscribeRoute(ctx, client, events.EventRecorded{}, "mercadolivre",
+    func(ctx context.Context, msg events.EventRecorded) error {
+        return orderService.Record(ctx, msg.ID)
+    })
+if err != nil {
+    log.Fatal(err)
+}
+
+client.Start(ctx) // call after every handler is subscribed
 
 // Publishing the fact this service owns.
 err = client.Publish(ctx, orders.OrderCreated{OrderID: "123", Total: 4990})
@@ -99,15 +131,37 @@ err = client.Publish(ctx, orders.OrderCreated{OrderID: "123", Total: 4990})
 
 `Publish` only accepts messages of the exchange the client owns:
 `client.Publish(ctx, payments.PaymentConfirmed{})` does not compile, so a service
-cannot forge another service's facts. `RegisterHandler` is deliberately free —
+cannot forge another service's facts. Subscribing is deliberately free —
 consuming what others publish is the point — and binds the queue to the exchange
 owning the message, declaring it if that service has not started yet. Pointers
 publish alike: `*OrderCreated` and `OrderCreated` share the exchange and the
 routing key. A panic inside a handler is recovered and treated as a failure — it
-never takes the consumer down. A second handler for the same `(exchange, routing
-key)` is rejected instead of replacing the first, and a message type with no name
+never takes the consumer down. A second subscription for the same binding is
+rejected instead of replacing the first, and a message type with no name
 (an anonymous struct) is rejected by `Publish`: its routing key would be empty and
 match no binding.
+
+### Subscribing
+
+| Call | What the queue receives |
+| --- | --- |
+| `Subscribe(ctx, client, T{}, handler)` | every message of type `T`, whatever route it carries |
+| `SubscribeRoute(ctx, client, T{}, route, handler)` | the messages of type `T` carrying `route`; only a `RoutedMsg` compiles |
+
+N pods of one service share a queue and compete for each message; two services
+have two queues and each receives a copy. Two queues wanting **different slices**
+of one type are the third case, and the one a fixed routing key cannot express:
+they bind different routing keys instead, so neither receives the other's half.
+
+Both ends of a route go through the same encoder, so a route is any string your
+domain already uses — a dot, a space, an accent, a `#` — and neither the publisher
+nor the binding can read it as anything but one route. Nothing is rejected and
+nothing is rewritten behind your back; the one limit is the AMQP one, and a
+routing key past 255 bytes is answered with `rabbitmq.ErrRoutingKeyTooLong`
+instead of being truncated into somebody else's route.
+
+Subscribing a type whole and one of its routes on the same client is allowed, and
+the route wins for the messages that carry it.
 
 Two message types may share a name — an `OrderCreated` in `orders` and another in
 `billing` — and therefore a routing key. The exchange separates them: each binding
@@ -131,9 +185,10 @@ the handler that owns it.
 ## Design: a neutral port and a driver
 
 The root package `gorabbit` holds the driver-neutral contracts — `Exchange`,
-`Msg`, `Message`, `OwnedBy`, `Handler`, `Publisher`, `Consumer`, `Cache`,
-`Logger`, `HeaderCarrier`. The `gorabbit/rabbitmq` subpackage is the RabbitMQ
-driver and depends on those contracts, never the other way around.
+`Msg`, `RoutedMsg`, `Message`, `OwnedBy`, `RoutedMessage`, `Handler`,
+`Publisher`, `Consumer`, `Cache`, `Logger`, `HeaderCarrier`. The
+`gorabbit/rabbitmq` subpackage is the RabbitMQ driver and depends on those
+contracts, never the other way around.
 
 Your domain code therefore imports only `gorabbit` (no AMQP types leak into it),
 and the broker choice stays at the composition root:
@@ -144,15 +199,17 @@ type Publisher[E Exchange] interface {
 }
 ```
 
-`Message` and `OwnedBy[E]` are satisfied only by embedding `Msg[E]`: the methods
+`Message` and `OwnedBy[E]` are satisfied only by embedding a marker: the methods
 it promotes are unexported, so nothing else can implement them and there is
 nothing for application code to call. `Message` is any fact, whoever owns it;
-`OwnedBy[E]` is a fact of the exchange `E`.
+`OwnedBy[E]` is a fact of the exchange `E`; `RoutedMessage` is a fact that picks
+its own route.
 
 ### What a message type may be
 
 - A named struct, exported or not, embedding one marker. The routing key is the
-  type name without the package.
+  type name without the package, plus the encoded route when the marker is
+  `RoutedMsg`.
 - A pointer to one. `Publish(ctx, &OrderCreated{})` is the same message; a typed
   nil returns an error instead of panicking.
 - Not a generic type: the routing key of `Envelope[Order]` is the instantiated
@@ -180,10 +237,12 @@ between attempts, each one bounded by `WithDialTimeout`) and heals itself on the
 first successful connection:
 
 - `Publish` stores the message in the `Cache` and returns nil; cached messages
-  are published — in order — on the next successful connection.
-- `RegisterHandler` and `Start` work while disconnected: the topology is
-  declared and the queue bindings are applied when the connection lands, and the
-  consumer starts consuming.
+  are published — in order — on the next successful connection. A message no
+  binding could ever match is the exception: an unnamed type or a routing key
+  past the AMQP limit is answered with an error and never reaches the cache.
+- `Subscribe`, `SubscribeRoute` and `Start` work while disconnected: the topology
+  is declared and the queue bindings are applied when the connection lands, and
+  the consumer starts consuming.
 - `Connected()` reports the current state — for health checks and metrics, never
   a precondition for calling anything.
 - A topology the broker refuses — a queue argument changed between deploys, say —
@@ -197,8 +256,27 @@ first successful connection:
 - After `Close`, `Publish` neither caches nor reconnects: it returns
   `rabbitmq.ErrClientClosed`.
 
-Each registered handler is also recorded in the cache, so on the next start
-bindings whose handler no longer exists in the code are unbound.
+Each subscription is also recorded in the cache, so on the next start bindings
+whose handler no longer exists in the code are unbound.
+
+The cache entries of a client are keyed by its app name and exchange, plus its
+queue when it consumes, so two clients of one process never replay each other's
+messages nor unbind each other's bindings. Reaching for a key another live client
+already holds is a mistake only a deploy fixes, so `Connect` refuses it with
+`rabbitmq.ErrCacheKeyTaken` and names the client that has it. Two *processes* of
+the same application are the opposite case — they are meant to share the key, and
+the reservation below is what keeps them from publishing the same message twice.
+
+### A message with nowhere to go
+
+Every publish is `mandatory`, so a routing key no queue is bound to comes back
+instead of being dropped by the broker behind a confirm that says it was
+delivered — which is what happens to every event published before its consumer
+first started. A returned message is not a delivery: it goes into the same cache
+a broker outage fills, and the client retries it with a growing delay, logging an
+error on every attempt. Nothing announces a binding, so the timer is the only way
+back; the message leaves the cache when it finally routes, and a message that
+routes is never held back by one that does not.
 
 `gorabbit.NewMemoryCache()` is process-local and good enough for a single
 instance; a shared store (Redis) is what makes cached messages and bindings
@@ -207,6 +285,7 @@ survive a restart.
 ```go
 type Cache interface {
     Set(ctx context.Context, key string, data []byte, ttl time.Duration) error
+    SetIfAbsent(ctx context.Context, key string, data []byte, ttl time.Duration) (bool, error)
     Get(ctx context.Context, key string) ([]byte, error)
     GetAllKeys(ctx context.Context, pattern string) ([]string, error)
     Delete(ctx context.Context, keys ...string) error
@@ -215,6 +294,50 @@ type Cache interface {
 
 A `ttl` of zero means no expiration, `Get` returns `nil, nil` when the key is
 absent, and `GetAllKeys` receives a glob pattern (`*` and `?`).
+
+`SetIfAbsent` writes the key only if it is not there and returns whether *this*
+call is the one that wrote it. It is the only operation that has to be atomic,
+and it must be atomic **against every other process on the same store**, not
+only against the goroutines of this one — a read followed by a write is not an
+implementation of it. Every store has the primitive:
+
+| Store | Call |
+| --- | --- |
+| Redis | `SET key value NX PX <ttl>` — a null reply means the key was already there |
+| Memcached | `ADD` |
+| In-memory | a map under a mutex, expiry checked before the absence test |
+
+An implementation that always returns `true` compiles and passes a single-instance
+deployment, then delivers every offline message once per replica.
+
+### Sharing one cache between replicas
+
+N replicas of one application publish to one exchange under one app name, so they
+share a cache scope, and after an outage they all hold the same cached messages.
+Before publishing one of them, a client **reserves** it: `SetIfAbsent` on a lease
+key, with a ttl derived from `WithPublishConfirmTimeout` so it outlives a whole
+publish attempt, confirmation included. Whoever loses the reservation skips that
+message and moves to the next, and comes back to it later if it is still cached.
+
+The lease lives under a prefix of its own, outside the one the flush scans, so it
+is never mistaken for a message. It is given back when the publish fails, and
+left to expire when it succeeds.
+
+What that buys, and what it costs:
+
+- a replica joining during a rolling deploy is never refused, and it does not
+  republish what the outgoing one is already publishing;
+- a replica that is killed mid-publish holds its lease until it expires, and
+  another replica then finishes the delivery — nothing is stranded;
+- delivery stays **at-least-once**: a process that dies after the broker took the
+  message but before the entry left the cache makes it be delivered again when
+  the lease expires. The `MessageId` is stable across replays, which is what lets
+  a consumer discard the duplicate.
+
+Two clients *of one process* reaching for the same cache key is still a
+configuration mistake, and `Connect` refuses it with `rabbitmq.ErrCacheKeyTaken`.
+The lease is what makes sharing between processes safe; the refusal is what
+catches the mistake inside one.
 
 ## Message id
 

@@ -81,9 +81,31 @@ type auditRouteEvent struct {
 	ID string `json:"id"`
 }
 
+type auditRearmExchange struct{}
+
+func (auditRearmExchange) Name() string { return "audit-rearm-events" }
+
+type auditRearmEvent struct {
+	gorabbit.Msg[auditRearmExchange]
+	ID string `json:"id"`
+}
+
+type auditStuckExchange struct{}
+
+func (auditStuckExchange) Name() string { return "audit-stuck-events" }
+
+type auditStuckEvent struct {
+	gorabbit.Msg[auditStuckExchange]
+	ID string `json:"id"`
+}
+
 // Long enough that a local broker would have delivered whatever it was going
 // to deliver, which is what makes the absence of a message an assertion.
 const absenceWindow = time.Second
+
+// Ends before the flush every fresh connection schedules, so a delivery inside
+// it can only be the retry loop of the message with no destination.
+const unroutableRetryWindow = delayedFlushDelay - 2*time.Second
 
 func collectIDs[T gorabbit.Message](received chan<- string, id func(T) string) gorabbit.Handler[T] {
 	return func(_ context.Context, msg T) error {
@@ -137,7 +159,7 @@ func TestAuditConcurrentFlushesPublishTheSameCachedMessageTwice(t *testing.T) {
 	received := make(chan string, cached*flushes*2)
 
 	c := newConsumer[auditFlushExchange](t, "audit-flush-queue")
-	require.NoError(t, RegisterHandler(ctx, c, auditFlushEvent{}, collectIDs(received, func(m auditFlushEvent) string { return m.ID })))
+	require.NoError(t, Subscribe(ctx, c, auditFlushEvent{}, collectIDs(received, func(m auditFlushEvent) string { return m.ID })))
 	c.Start(ctx)
 
 	expected := make(map[string]struct{}, cached)
@@ -192,7 +214,7 @@ func TestAuditCancellingStartContextDoesNotDropConnectedState(t *testing.T) {
 		// healing it.
 		return s.WithReconnectDelay(30 * time.Second).WithLogger(auditLogger{t})
 	})
-	require.NoError(t, RegisterHandler(ctx, c, auditCancelEvent{}, func(context.Context, auditCancelEvent) error { return nil }))
+	require.NoError(t, Subscribe(ctx, c, auditCancelEvent{}, func(context.Context, auditCancelEvent) error { return nil }))
 	c.Start(ctx)
 	require.True(t, waitQueueConsumers(t, queue, 1, 10*time.Second), "the consumer never registered on the broker")
 
@@ -259,7 +281,7 @@ func TestAuditCloseDrainsTheInFlightHandler(t *testing.T) {
 	var finished atomic.Bool
 
 	c := newConsumer[auditDrainExchange](t, "audit-drain-queue")
-	require.NoError(t, RegisterHandler(ctx, c, auditDrainEvent{}, func(context.Context, auditDrainEvent) error {
+	require.NoError(t, Subscribe(ctx, c, auditDrainEvent{}, func(context.Context, auditDrainEvent) error {
 		entered <- struct{}{}
 		<-release
 		finished.Store(true)
@@ -335,7 +357,7 @@ func TestAuditBindOnConsumerChannelWhileDeadLettering(t *testing.T) {
 	c := newConsumer[auditHammerExchange](t, "audit-hammer-queue", func(s *Setup[auditHammerExchange]) *Setup[auditHammerExchange] {
 		return s.WithRetry(1, 50*time.Millisecond, nil).WithPrefetchCount(50).WithLogger(errs)
 	})
-	require.NoError(t, RegisterHandler(ctx, c, auditHammerEvent{}, func(context.Context, auditHammerEvent) error {
+	require.NoError(t, Subscribe(ctx, c, auditHammerEvent{}, func(context.Context, auditHammerEvent) error {
 		attempts.Add(1)
 		return errors.New("always fails")
 	}))
@@ -488,30 +510,107 @@ func waitQueuesDrained(t *testing.T, queues []string, timeout time.Duration) int
 	}
 }
 
-func TestAuditPublishToAnExchangeWithNoBindingIsSilentlyDropped(t *testing.T) {
+// A message the broker cannot route used to be dropped behind a confirm that
+// said it was delivered, so every event published before its consumer existed
+// was lost without a trace.
+func TestAuditPublishWithNoBindingIsKeptUntilAQueueBinds(t *testing.T) {
 	skipWithoutBroker(t)
 	t.Parallel()
 
 	ctx := context.Background()
-	// The claim only holds while nothing is bound, and a queue left over by an
-	// earlier run of this test is a binding.
+	// A queue left over by an earlier run is a binding, and the message under
+	// test has to meet an exchange nothing is listening on.
 	deleteQueue(t, "audit-route-queue")
-	p, err := NewSetup[auditRouteExchange](brokerURL, "audit-route-app").Connect(gorabbit.NewMemoryCache())
+
+	// Connected and declared, but bound to nothing of this exchange until the
+	// subscription below, which is a call away from the publish.
+	c := newConsumer[auditRouteExchange](t, "audit-route-queue")
+
+	cache := gorabbit.NewMemoryCache()
+	p, err := NewSetup[auditRouteExchange](brokerURL, "audit-route-app").Connect(cache)
 	require.NoError(t, err)
 	t.Cleanup(p.Close)
 
 	require.NoError(t, p.Publish(ctx, auditRouteEvent{ID: "unroutable"}))
 
-	c := newConsumer[auditRouteExchange](t, "audit-route-queue")
+	keys, err := cache.GetAllKeys(ctx, cacheKey(p.cacheScope(), "")+"*")
+	require.NoError(t, err)
+	require.Len(t, keys, 1, "the broker gave the message back and the confirm still passed for a delivery")
+
 	received := make(chan string, 1)
-	require.NoError(t, RegisterHandler(ctx, c, auditRouteEvent{}, collectIDs(received, func(m auditRouteEvent) string { return m.ID })))
+	require.NoError(t, Subscribe(ctx, c, auditRouteEvent{}, collectIDs(received, func(m auditRouteEvent) string { return m.ID })))
 	c.Start(ctx)
 
-	select {
-	case id := <-received:
-		t.Fatalf("message %q published before any binding existed should have been dropped", id)
-	case <-time.After(absenceWindow):
-	}
+	// Nothing announces a binding, so the publish has to wake the retry itself.
+	require.Equal(t, "unroutable", waitForMessageWithin(t, received, unroutableRetryWindow))
+
+	require.Eventually(t, func() bool {
+		keys, err := cache.GetAllKeys(ctx, cacheKey(p.cacheScope(), "")+"*")
+		return err == nil && len(keys) == 0
+	}, 10*time.Second, 100*time.Millisecond, "a delivered message must leave the cache")
+}
+
+// A message cached while the broker was unreachable is only found to have no
+// destination by the flush of the reconnection, so only that flush can rearm.
+func TestAuditFlushAfterReconnectionRearmsTheUnroutableRetry(t *testing.T) {
+	skipWithoutBroker(t)
+	t.Parallel()
+
+	ctx := context.Background()
+	const queue = "audit-rearm-queue"
+	deleteQueue(t, queue)
+
+	c := newConsumer[auditRearmExchange](t, queue)
+
+	cache := gorabbit.NewMemoryCache()
+	offline, err := NewSetup[auditRearmExchange](unreachableURL, "audit-rearm-app").
+		WithDialTimeout(200 * time.Millisecond).
+		Connect(cache)
+	require.NoError(t, err)
+	require.False(t, offline.Connected())
+	// Cached by the offline path, which knows nothing about destinations.
+	require.NoError(t, offline.Publish(ctx, auditRearmEvent{ID: "cached"}))
+	offline.Close()
+
+	p, err := NewSetup[auditRearmExchange](brokerURL, "audit-rearm-app").Connect(cache)
+	require.NoError(t, err)
+	t.Cleanup(p.Close)
+	require.True(t, p.Connected())
+
+	received := make(chan string, 1)
+	require.NoError(t, Subscribe(ctx, c, auditRearmEvent{}, collectIDs(received, func(m auditRearmEvent) string { return m.ID })))
+	c.Start(ctx)
+
+	require.Equal(t, "cached", waitForMessageWithin(t, received, unroutableRetryWindow))
+}
+
+// One message with nowhere to go must not hold back the ones that do route.
+func TestAuditUnroutableMessageDoesNotBlockTheRestOfTheCache(t *testing.T) {
+	skipWithoutBroker(t)
+	t.Parallel()
+
+	ctx := context.Background()
+	received := make(chan string, 4)
+
+	c := newConsumer[auditStuckExchange](t, "audit-stuck-queue")
+	require.NoError(t, Subscribe(ctx, c, auditStuckEvent{}, collectIDs(received, func(m auditStuckEvent) string { return m.ID })))
+	c.Start(ctx)
+
+	stray, err := c.getPublishMessage(ctx, auditStuckEvent{ID: "stray"})
+	require.NoError(t, err)
+	stray.RoutingKey = "nobodyBoundThis"
+	require.NoError(t, c.cacheMessage(ctx, stray))
+
+	routable, err := c.getPublishMessage(ctx, auditStuckEvent{ID: "routable"})
+	require.NoError(t, err)
+	require.NoError(t, c.cacheMessage(ctx, routable))
+
+	require.Equal(t, 1, c.flushCachedMessages(ctx), "the flush stopped at the message with no destination")
+	require.Equal(t, "routable", waitForMessage(t, received))
+
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
+	require.NoError(t, err)
+	require.Equal(t, []string{cacheKey(c.cacheScope(), stray.MsgID)}, keys)
 }
 
 func deleteQueue(t *testing.T, queue string) {
@@ -592,7 +691,7 @@ func TestAuditWrongCredentialsStartTheClientDisconnectedInsteadOfFailing(t *test
 
 	require.NoError(t, c.Publish(ctx, auditCredentialsEvent{ID: "cached"}))
 
-	keys, err := cache.GetAllKeys(ctx, cacheKey(app, "")+"*")
+	keys, err := cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1, "the publish was answered with the rejection instead of being cached until the broker is reachable")
 }

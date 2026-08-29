@@ -94,10 +94,12 @@ func startBroker(t *testing.T, broker *testcontainers.DockerContainer, port int)
 	}, reconnectWait, 200*time.Millisecond, "broker did not come back")
 }
 
+// The app name carries the test name: these run in parallel and two clients of
+// one process may not share a cache key.
 func newOutageClient(t *testing.T, port int, consumer bool, opts ...func(*Setup[outageExchange]) *Setup[outageExchange]) *Client[outageExchange] {
 	t.Helper()
 
-	setup := NewSetup[outageExchange](brokerURLAt(port), "outage-app").
+	setup := NewSetup[outageExchange](brokerURLAt(port), t.Name()).
 		WithDialTimeout(testDialTimeout).
 		WithReconnectDelay(testReconnectWait)
 	if consumer {
@@ -116,7 +118,7 @@ func newOutageClient(t *testing.T, port int, consumer bool, opts ...func(*Setup[
 
 func registerCollector(t *testing.T, c *Client[outageExchange], received chan<- string) {
 	t.Helper()
-	require.NoError(t, RegisterHandler(context.Background(), c, outageEvent{},
+	require.NoError(t, Subscribe(context.Background(), c, outageEvent{},
 		func(_ context.Context, msg outageEvent) error {
 			received <- msg.ID
 			return nil
@@ -254,7 +256,7 @@ func TestReconnectConsumerOnlyClientSurvivesBrokerRestart(t *testing.T) {
 	registerCollector(t, consumer, received)
 	consumer.Start(ctx)
 
-	producer, err := NewSetup[outageExchange](brokerURLAt(port), "outage-producer").
+	producer, err := NewSetup[outageExchange](brokerURLAt(port), t.Name()+"-producer").
 		WithDialTimeout(testDialTimeout).
 		WithReconnectDelay(testReconnectWait).
 		Connect(gorabbit.NewMemoryCache())
@@ -324,7 +326,7 @@ func TestReconnectHandlerRegisteredWhileDisconnectedIsBoundOnConnect(t *testing.
 	startBrokerAt(t, port)
 	require.Eventually(t, consumer.Connected, reconnectWait, 100*time.Millisecond)
 
-	producer, err := NewSetup[outageExchange](brokerURLAt(port), "outage-producer").Connect(gorabbit.NewMemoryCache())
+	producer, err := NewSetup[outageExchange](brokerURLAt(port), t.Name()+"-producer").Connect(gorabbit.NewMemoryCache())
 	require.NoError(t, err)
 	t.Cleanup(producer.Close)
 	require.NoError(t, producer.Publish(ctx, outageEvent{ID: "late-0"}))
@@ -428,7 +430,7 @@ func TestReconnectRetryInFlightSurvivesBrokerRestart(t *testing.T) {
 	client := newOutageClient(t, port, true, func(s *Setup[outageExchange]) *Setup[outageExchange] {
 		return s.WithRetry(3, 4*time.Second, nil)
 	})
-	require.NoError(t, RegisterHandler(ctx, client, outageEvent{},
+	require.NoError(t, Subscribe(ctx, client, outageEvent{},
 		func(_ context.Context, msg outageEvent) error {
 			if attempts.Add(1) == 1 {
 				firstFailed <- struct{}{}
@@ -606,7 +608,7 @@ func TestReconnectPublishTornDownBeforeItsConfirmIsNotLost(t *testing.T) {
 	received := make(chan string, 4)
 
 	consumer := newConsumer[confirmExchange](t, "confirm-queue")
-	require.NoError(t, RegisterHandler(ctx, consumer, confirmEvent{},
+	require.NoError(t, Subscribe(ctx, consumer, confirmEvent{},
 		func(_ context.Context, msg confirmEvent) error {
 			received <- msg.ID
 			return nil
@@ -640,7 +642,7 @@ func TestReconnectPublishTornDownBeforeItsConfirmIsNotLost(t *testing.T) {
 		t.Fatal("Publish did not return after the connection was torn down")
 	}
 
-	keys, err := cache.GetAllKeys(ctx, cacheKey("confirm-producer", "")+"*")
+	keys, err := cache.GetAllKeys(ctx, cacheKey(producer.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1, "a publish the broker never confirmed must stay in the cache")
 
@@ -648,7 +650,7 @@ func TestReconnectPublishTornDownBeforeItsConfirmIsNotLost(t *testing.T) {
 
 	requireExactlyOnce(t, received, expectedIDs("unconfirmed", 1))
 	require.Eventually(t, func() bool {
-		keys, err := cache.GetAllKeys(ctx, cacheKey("confirm-producer", "")+"*")
+		keys, err := cache.GetAllKeys(ctx, cacheKey(producer.cacheScope(), "")+"*")
 		return err == nil && len(keys) == 0
 	}, reconnectWait, 100*time.Millisecond, "a delivered message must leave the cache")
 }

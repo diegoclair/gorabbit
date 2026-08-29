@@ -2,6 +2,8 @@ package gorabbit
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,6 +76,60 @@ func TestMemoryCache(t *testing.T) {
 			_, stale := entries.entries["expiring"]
 			return !stale && len(entries.entries) == 1
 		}, time.Second, 10*time.Millisecond, "writing around the expired entry leaks it")
+	})
+
+	t.Run("set if absent writes once and tells the winner from the losers", func(t *testing.T) {
+		c := NewMemoryCache()
+
+		stored, err := c.SetIfAbsent(ctx, "key", []byte("first"), 0)
+		require.NoError(t, err)
+		require.True(t, stored)
+
+		stored, err = c.SetIfAbsent(ctx, "key", []byte("second"), 0)
+		require.NoError(t, err)
+		require.False(t, stored)
+
+		data, err := c.Get(ctx, "key")
+		require.NoError(t, err)
+		require.Equal(t, []byte("first"), data)
+	})
+
+	t.Run("set if absent writes again once the ttl has run out", func(t *testing.T) {
+		c := NewMemoryCache()
+
+		stored, err := c.SetIfAbsent(ctx, "key", []byte("first"), 10*time.Millisecond)
+		require.NoError(t, err)
+		require.True(t, stored)
+
+		require.Eventually(t, func() bool {
+			stored, err := c.SetIfAbsent(ctx, "key", []byte("second"), time.Minute)
+			return err == nil && stored
+		}, time.Second, 10*time.Millisecond, "the expired entry never gave the key back")
+	})
+
+	t.Run("only one concurrent writer gets the key", func(t *testing.T) {
+		c := NewMemoryCache()
+
+		const writers = 32
+		var wg sync.WaitGroup
+		var won atomic.Int32
+		start := make(chan struct{})
+
+		for range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				stored, err := c.SetIfAbsent(ctx, "key", []byte("value"), time.Minute)
+				if err == nil && stored {
+					won.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		require.Equal(t, int32(1), won.Load())
 	})
 
 	t.Run("get all keys filters by pattern", func(t *testing.T) {

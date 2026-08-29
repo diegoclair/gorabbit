@@ -11,7 +11,17 @@ func (Exchange) Name() string { return "orders" }
 
 type msg = gorabbit.Msg[Exchange]
 
+type routedMsg = gorabbit.RoutedMsg[Exchange]
+
 type OrderCreated struct {
 	msg
 	OrderID string `json:"order_id"`
 }
+
+type OrderShipped struct {
+	routedMsg
+	OrderID string `json:"order_id"`
+	Carrier string `json:"carrier"`
+}
+
+func (o OrderShipped) RouteBy() string { return o.Carrier }

@@ -171,14 +171,15 @@ func (s *Setup[E]) validate() error {
 // The connection and its channels are swapped in as one: a client holding
 // channels from two connections would publish over a socket nobody watches.
 type brokerConn struct {
-	conn  *amqp091.Connection
-	ch    *amqp091.Channel
-	pubCh *amqp091.Channel
+	conn    *amqp091.Connection
+	ch      *amqp091.Channel
+	pubCh   *amqp091.Channel
+	returns *returnTracker
 }
 
 type handlerInfo struct {
 	Exchange   string
-	RoutingKey string
+	BindingKey string
 	handler    func(context.Context, amqp091.Delivery) error
 }
 
@@ -189,10 +190,13 @@ type Client[E gorabbit.Exchange] struct {
 	ch   *amqp091.Channel
 	// Publishing gets its own channel: amqp091 does not serialize a multi-frame
 	// publish against control methods (Consume, QueueBind) on the same channel.
-	pubCh       *amqp091.Channel
+	pubCh *amqp091.Channel
+	// The tracker belongs to the publish channel, so it is swapped in with it.
+	returns     *returnTracker
 	setup       *Setup[E]
 	cache       gorabbit.Cache
 	isConnected bool
+	claimedKey  bool
 	// setupErr holds the last topology rejection, so a caller that skipped the
 	// dial answers with it instead of caching behind it.
 	setupErr   error
@@ -202,6 +206,7 @@ type Client[E gorabbit.Exchange] struct {
 	consumerWg sync.WaitGroup
 	dialing    atomic.Bool
 	flushing   atomic.Bool
+	pending    chan struct{}
 	handlersMu sync.RWMutex
 	handlers   map[string]handlerInfo
 }
@@ -211,6 +216,7 @@ func newClient[E gorabbit.Exchange](setup *Setup[E], cache gorabbit.Cache) *Clie
 		setup:    setup,
 		cache:    cache,
 		done:     make(chan struct{}),
+		pending:  make(chan struct{}, 1),
 		handlers: make(map[string]handlerInfo),
 	}
 }
@@ -242,6 +248,10 @@ func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 
 	c := newClient(s, cache)
 
+	if err := c.claimCacheKey(); err != nil {
+		return nil, err
+	}
+
 	if err := c.reconnect(ctx); err != nil {
 		// Only a deploy fixes a refused topology, so it must stop the boot
 		// instead of leaving a client that can never publish.
@@ -256,6 +266,7 @@ func (s *Setup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
 
 	// Started here, not in Start: a publish-only client must also heal.
 	go c.monitorConnection(ctx)
+	go c.retryPendingMessages(ctx)
 
 	return c, nil
 }
@@ -342,6 +353,8 @@ func (c *Client[E]) dial(ctx context.Context) (*brokerConn, error) {
 		return nil, err
 	}
 
+	bc.returns = newReturnTracker(bc.pubCh)
+
 	if c.setup.isConsumer && c.setup.preFetchCount > 0 {
 		if err = bc.ch.Qos(c.setup.preFetchCount, 0, false); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to set prefetch count", c.connFields("error", err)...)
@@ -370,7 +383,7 @@ func (c *Client[E]) establish(ctx context.Context, bc *brokerConn) error {
 		return ErrClientClosed
 	}
 
-	c.conn, c.ch, c.pubCh = bc.conn, bc.ch, bc.pubCh
+	c.conn, c.ch, c.pubCh, c.returns = bc.conn, bc.ch, bc.pubCh, bc.returns
 	c.setupErr = nil
 	c.isConnected = true
 
@@ -382,7 +395,7 @@ func (c *Client[E]) establish(ctx context.Context, bc *brokerConn) error {
 func (c *Client[E]) dropConnection() {
 	c.mu.Lock()
 	conn := c.conn
-	c.conn, c.ch, c.pubCh = nil, nil, nil
+	c.conn, c.ch, c.pubCh, c.returns = nil, nil, nil, nil
 	c.isConnected = false
 	c.mu.Unlock()
 
@@ -430,6 +443,7 @@ func (c *Client[E]) Close() {
 		}
 
 		c.isConnected = false
+		c.releaseCacheKey()
 	})
 }
 
@@ -458,7 +472,7 @@ func (c *Client[E]) applyTopology(ctx context.Context, ch *amqp091.Channel) erro
 // holds c.handlersMu.
 func (c *Client[E]) bindRegisteredHandlers(ctx context.Context, ch *amqp091.Channel) error {
 	for _, hi := range c.handlers {
-		if err := c.bindQueueToExchange(ctx, ch, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
+		if err := c.bindQueueToExchange(ctx, ch, hi.Exchange, hi.BindingKey, c.setup.queueName, true); err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)
 			return err
 		}
@@ -622,15 +636,15 @@ func (c *Client[E]) withConsumerChannel(fn func(*amqp091.Channel) error) error {
 
 // publishChannel guards the channel pointer, which a reconnection may swap
 // while a publisher is using it.
-func (c *Client[E]) publishChannel() (*amqp091.Channel, error) {
+func (c *Client[E]) publishChannel() (*amqp091.Channel, *returnTracker, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.live() || c.pubCh == nil {
-		return nil, errNotConnected
+	if !c.live() || c.pubCh == nil || c.returns == nil {
+		return nil, nil, errNotConnected
 	}
 
-	return c.pubCh, nil
+	return c.pubCh, c.returns, nil
 }
 
 // Connected reports whether the client holds a live connection right now — for
@@ -725,7 +739,7 @@ func (c *Client[E]) bindHandler(ctx context.Context, hi handlerInfo) {
 		return
 	}
 
-	if err := c.bindQueueToExchange(ctx, c.ch, hi.Exchange, hi.RoutingKey, c.setup.queueName, true); err != nil {
+	if err := c.bindQueueToExchange(ctx, c.ch, hi.Exchange, hi.BindingKey, c.setup.queueName, true); err != nil {
 		// A failed bind closes the channel; dropping the connected state makes
 		// the reconnect loop rebuild it and re-bind every registered handler.
 		c.setup.logger.Error(ctx, "gorabbit: error to bind queue to exchange", "error", err)

@@ -19,27 +19,63 @@ const (
 	originExchangeHeaderKey = "x-origin-exchange"
 )
 
-// RegisterHandler routes every message of type T to handler, whatever exchange
-// owns T — consuming facts owned by other applications is the point. It binds
-// the consumer queue to that exchange — immediately when connected, on the next
-// connection otherwise — and must be called before Start.
-func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Context, c *Client[E], msgType T, handler gorabbit.Handler[T]) error {
-	if !c.setup.isConsumer {
-		return errors.New("gorabbit: client is not a consumer, use WithConsumer")
-	}
-	if handler == nil {
-		return errors.New("gorabbit: handler is required")
-	}
-
-	msgName := messageTypeName(msgType)
-	exchange, err := exchangeOf(msgType)
+// Subscribe takes the whole of type T, whoever owns it and whatever route it
+// carries. It binds the consumer queue and must be called before Start.
+func Subscribe[T gorabbit.Message, E gorabbit.Exchange](ctx context.Context, c *Client[E], msgType T, handler gorabbit.Handler[T]) error {
+	typeName, exchange, err := subscriptionOf(c, msgType, handler)
 	if err != nil {
 		return err
 	}
 
+	bindingKey := typeName
+	if gorabbit.IsRouted(msgType) {
+		bindingKey += allRoutesSuffix
+	}
+
+	return registerHandler(ctx, c, exchange, bindingKey, handler)
+}
+
+// SubscribeRoute takes one slice of type T, so several queues can split it
+// instead of each receiving every copy. Only a routed message compiles here.
+func SubscribeRoute[T gorabbit.RoutedMessage, E gorabbit.Exchange](ctx context.Context, c *Client[E], msgType T, route string, handler gorabbit.Handler[T]) error {
+	typeName, exchange, err := subscriptionOf(c, msgType, handler)
+	if err != nil {
+		return err
+	}
+
+	bindingKey := routedKey(typeName, route)
+	if err := checkRoutingKeyLength(bindingKey); err != nil {
+		return err
+	}
+
+	return registerHandler(ctx, c, exchange, bindingKey, handler)
+}
+
+func subscriptionOf[T gorabbit.Message, E gorabbit.Exchange](c *Client[E], msgType T, handler gorabbit.Handler[T]) (typeName, exchange string, err error) {
+	if !c.setup.isConsumer {
+		return "", "", errors.New("gorabbit: client is not a consumer, use WithConsumer")
+	}
+	if handler == nil {
+		return "", "", errors.New("gorabbit: handler is required")
+	}
+
+	exchange, err = exchangeOf(msgType)
+	if err != nil {
+		return "", "", err
+	}
+
+	typeName = messageTypeName(msgType)
+	if typeName == "" {
+		return "", "", errEmptyTypeName
+	}
+
+	return typeName, exchange, nil
+}
+
+func registerHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Context, c *Client[E], exchange, bindingKey string, handler gorabbit.Handler[T]) error {
 	hi := handlerInfo{
 		Exchange:   exchange,
-		RoutingKey: msgName,
+		BindingKey: bindingKey,
 		handler: func(ctx context.Context, msg amqp091.Delivery) error {
 			return handleMessageSafely(ctx, c, &msg, handler)
 		},
@@ -47,7 +83,7 @@ func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Contex
 
 	// Registered before binding: a connection landing in between re-binds every
 	// registered handler, so the bind is never lost.
-	key := handlersMapKey(exchange, msgName)
+	key := handlersMapKey(exchange, bindingKey)
 	c.handlersMu.Lock()
 	if _, ok := c.handlers[key]; ok {
 		c.handlersMu.Unlock()
@@ -68,8 +104,8 @@ func RegisterHandler[T gorabbit.Message, E gorabbit.Exchange](ctx context.Contex
 	return nil
 }
 
-func handlersMapKey(exchange, routingKey string) string {
-	return fmt.Sprintf("%s:%s", exchange, routingKey)
+func handlersMapKey(exchange, bindingKey string) string {
+	return fmt.Sprintf("%s:%s", exchange, bindingKey)
 }
 
 // storeHandlerInfo records the binding so a later run can unbind it once the
@@ -90,7 +126,7 @@ func (c *Client[E]) storeHandlerInfo(ctx context.Context, info handlerInfo) erro
 }
 
 func (c *Client[E]) handlerInfoCacheKey(info handlerInfo) string {
-	return fmt.Sprintf("%s:%s:%s:%s", handlerInfoCachePrefix, c.setup.queueName, info.Exchange, info.RoutingKey)
+	return fmt.Sprintf("%s:%s:%s:%s", handlerInfoCachePrefix, c.cacheScope(), info.Exchange, info.BindingKey)
 }
 
 // handleMessageSafely turns a panic inside the handler into an error, so one bad
@@ -183,9 +219,8 @@ func (c *Client[E]) consumeMessages(ctx context.Context) error {
 	}
 }
 
-// handlerFor resolves the handler by exchange and routing key. A retried message
-// arrives through this consumer's own exchange, so it is matched by the exchange
-// it was originally published to.
+// handlerFor matches a retried message by the exchange it was published to, not
+// the consumer's own, and an unclaimed route by the type that took them all.
 func (c *Client[E]) handlerFor(msg *amqp091.Delivery) (handlerInfo, bool) {
 	exchange := msg.Exchange
 
@@ -196,8 +231,18 @@ func (c *Client[E]) handlerFor(msg *amqp091.Delivery) (handlerInfo, bool) {
 	}
 
 	c.handlersMu.RLock()
-	info, ok := c.handlers[handlersMapKey(exchange, msg.RoutingKey)]
-	c.handlersMu.RUnlock()
+	defer c.handlersMu.RUnlock()
+
+	if info, ok := c.handlers[handlersMapKey(exchange, msg.RoutingKey)]; ok {
+		return info, true
+	}
+
+	typeName := typeNameOf(msg.RoutingKey)
+	if typeName == msg.RoutingKey {
+		return handlerInfo{}, false
+	}
+
+	info, ok := c.handlers[handlersMapKey(exchange, typeName+allRoutesSuffix)]
 
 	return info, ok
 }
@@ -334,7 +379,7 @@ func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 		}
 	}
 
-	keys, err := c.cache.GetAllKeys(ctx, fmt.Sprintf("%s:%s:*", handlerInfoCachePrefix, c.setup.queueName))
+	keys, err := c.cache.GetAllKeys(ctx, fmt.Sprintf("%s:%s:*", handlerInfoCachePrefix, c.cacheScope()))
 	if err != nil {
 		c.setup.logger.Error(ctx, "gorabbit: error to get handler info keys", "error", err)
 		return
@@ -357,7 +402,7 @@ func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 		}
 
 		c.handlersMu.RLock()
-		_, registered := c.handlers[handlersMapKey(info.Exchange, info.RoutingKey)]
+		_, registered := c.handlers[handlersMapKey(info.Exchange, info.BindingKey)]
 		c.handlersMu.RUnlock()
 		if registered {
 			continue
@@ -365,12 +410,12 @@ func (c *Client[E]) unbindUnusedBindings(ctx context.Context) {
 
 		c.setup.logger.Debug(ctx, "gorabbit: unbinding unused binding",
 			"exchange", info.Exchange,
-			"routing_key", info.RoutingKey,
+			"binding_key", info.BindingKey,
 			"queue", c.setup.queueName,
 		)
 
 		err = c.withConsumerChannel(func(ch *amqp091.Channel) error {
-			return ch.QueueUnbind(c.setup.queueName, info.RoutingKey, info.Exchange, nil)
+			return ch.QueueUnbind(c.setup.queueName, info.BindingKey, info.Exchange, nil)
 		})
 		if err != nil {
 			c.setup.logger.Error(ctx, "gorabbit: error to unbind queue", "error", err)

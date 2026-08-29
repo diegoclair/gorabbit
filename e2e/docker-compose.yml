@@ -1,0 +1,27 @@
+name: gorabbit-e2e
+
+services:
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    # The harness reads publish counters per connection, and the default
+    # aggregation window is wide enough to attribute them to the wrong moment.
+    environment:
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit collect_statistics_interval 1000"
+    ports:
+      - "${E2E_AMQP_PORT:-5673}:5672"
+      - "${E2E_MGMT_PORT:-15673}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 3s
+      timeout: 10s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "${E2E_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20

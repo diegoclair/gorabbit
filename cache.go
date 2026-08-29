@@ -8,11 +8,15 @@ import (
 
 // Cache is the store drivers use to survive broker downtime (messages that
 // could not be published) and to track queue bindings across restarts.
-// A ttl of zero means no expiration; Get returns nil data and a nil error when
-// the key is absent; GetAllKeys receives a glob pattern (`*` and `?`).
 type Cache interface {
+	// A ttl of zero means no expiration.
 	Set(ctx context.Context, key string, data []byte, ttl time.Duration) error
+	// Writes only when absent, answering whether it was the writer; atomic
+	// across processes, or two of them publish one cached message.
+	SetIfAbsent(ctx context.Context, key string, data []byte, ttl time.Duration) (bool, error)
+	// An absent key is nil data and a nil error.
 	Get(ctx context.Context, key string) ([]byte, error)
+	// The pattern is a glob (`*` and `?`).
 	GetAllKeys(ctx context.Context, pattern string) ([]string, error)
 	Delete(ctx context.Context, keys ...string) error
 }
@@ -40,14 +44,35 @@ func (c *memoryCache) Set(_ context.Context, key string, data []byte, ttl time.D
 	defer c.mu.Unlock()
 
 	c.evictExpired()
+	c.store(key, data, ttl)
 
+	return nil
+}
+
+func (c *memoryCache) SetIfAbsent(_ context.Context, key string, data []byte, ttl time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// An entry past its ttl must not count as present, or the key is never
+	// given back.
+	c.evictExpired()
+
+	if _, taken := c.entries[key]; taken {
+		return false, nil
+	}
+
+	c.store(key, data, ttl)
+
+	return true, nil
+}
+
+// Caller holds the write lock.
+func (c *memoryCache) store(key string, data []byte, ttl time.Duration) {
 	entry := memoryEntry{data: data}
 	if ttl > 0 {
 		entry.expiresAt = time.Now().Add(ttl)
 	}
 	c.entries[key] = entry
-
-	return nil
 }
 
 func (c *memoryCache) Get(_ context.Context, key string) ([]byte, error) {

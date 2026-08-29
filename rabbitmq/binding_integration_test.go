@@ -56,19 +56,19 @@ func TestIntegrationUnbindDropsTheBindingOfAHandlerThatIsGone(t *testing.T) {
 	cache := gorabbit.NewMemoryCache()
 
 	previous := newSharedCacheConsumer[unbindExchange](t, queue, cache)
-	require.NoError(t, RegisterHandler(ctx, previous, unbindGone{},
+	require.NoError(t, Subscribe(ctx, previous, unbindGone{},
 		func(context.Context, unbindGone) error { return nil }))
 	previous.Start(ctx)
 	previous.Close()
 
 	received := make(chan string, 2)
 	current := newSharedCacheConsumer[unbindExchange](t, queue, cache)
-	require.NoError(t, RegisterHandler(ctx, current, unbindKept{},
+	require.NoError(t, Subscribe(ctx, current, unbindKept{},
 		collectIDs(received, func(m unbindKept) string { return m.ID })))
 	current.Start(ctx)
 
 	require.Eventually(t, func() bool {
-		keys, err := cache.GetAllKeys(ctx, fmt.Sprintf("%s:%s:*", handlerInfoCachePrefix, queue))
+		keys, err := cache.GetAllKeys(ctx, fmt.Sprintf("%s:%s:*", handlerInfoCachePrefix, current.cacheScope()))
 		return err == nil && len(keys) == 1
 	}, 30*time.Second, 100*time.Millisecond, "the binding of the handler that is gone was never unbound")
 
@@ -98,7 +98,7 @@ func TestIntegrationDeliveryWithoutAHandlerIsDeadLetteredOnce(t *testing.T) {
 	ctx := context.Background()
 
 	consumer := newConsumer[strayExchange](t, queue)
-	require.NoError(t, RegisterHandler(ctx, consumer, strayHandled{},
+	require.NoError(t, Subscribe(ctx, consumer, strayHandled{},
 		func(context.Context, strayHandled) error { return nil }))
 	consumer.Start(ctx)
 
@@ -124,7 +124,7 @@ func TestIntegrationHandlerErrorWithoutRetryIsDeadLetteredOnce(t *testing.T) {
 	var attempts atomic.Int32
 
 	consumer := newConsumer[deadExchange](t, queue)
-	require.NoError(t, RegisterHandler(ctx, consumer, deadEvent{}, func(context.Context, deadEvent) error {
+	require.NoError(t, Subscribe(ctx, consumer, deadEvent{}, func(context.Context, deadEvent) error {
 		attempts.Add(1)
 		return errors.New("always fails")
 	}))

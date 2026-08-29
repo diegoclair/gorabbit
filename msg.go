@@ -9,27 +9,8 @@ type Exchange interface {
 	Name() string
 }
 
-// Msg binds a message type to the exchange E. One package per exchange, holding
-// the marker as Exchange and an unexported alias for the embed, keeps the
-// plumbing out of sight of whoever reads the message:
-//
-//	package orders
-//
-//	type Exchange struct{}
-//	func (Exchange) Name() string { return "orders" }
-//
-//	type msg = gorabbit.Msg[Exchange]
-//
-//	type OrderCreated struct {
-//	    msg
-//	    OrderID string `json:"order_id"`
-//	}
-//
-// Embedding gorabbit.Msg[orders.Exchange] directly works too, at the cost of an
-// exported Msg field on the message. Either way Msg has no fields and no
-// exported methods, so it stays out of the serialized payload, and a struct with
-// two markers stops being a Message — the promoted methods turn ambiguous, so a
-// message belongs to exactly one exchange.
+// Msg marks a message every bound consumer receives a copy of. It has no fields
+// and no exported methods, so it stays out of the serialized payload.
 type Msg[E Exchange] struct{}
 
 func (Msg[E]) exchangeName() string {
@@ -41,9 +22,24 @@ func (Msg[E]) exchangeName() string {
 // refuse a message from another exchange at compile time.
 func (Msg[E]) ownedBy(E) {}
 
-// Message is any type embedding Msg[E], whatever its exchange. Only the embed
-// can promote the unexported method, so a type without a marker fails to compile
-// instead of failing on the broker.
+// RoutedMsg marks a message whose own value picks the routing key, so consumers
+// can split the type between queues instead of each receiving every copy. The
+// type must also implement RouteBy.
+type RoutedMsg[E Exchange] struct{}
+
+func (RoutedMsg[E]) exchangeName() string {
+	var e E
+	return e.Name()
+}
+
+func (RoutedMsg[E]) ownedBy(E) {}
+
+// routedMsg keeps RoutedMessage out of reach of a plain message that happens to
+// declare a RouteBy of its own.
+func (RoutedMsg[E]) routedMsg() {}
+
+// Message is any type embedding exactly one marker: the promoted method is
+// unexported, so nothing else implements it and two markers make it ambiguous.
 type Message interface {
 	exchangeName() string
 }
@@ -54,10 +50,36 @@ type OwnedBy[E Exchange] interface {
 	ownedBy(E)
 }
 
+// RoutedMessage is the constraint of a per-route subscription: a plain message
+// cannot satisfy it, and a routed one missing RouteBy does not compile.
+type RoutedMessage interface {
+	Message
+	routedMsg()
+	RouteBy() string
+}
+
 // ExchangeOf returns the exchange bound to the message type. Drivers need it;
 // application code does not.
 func ExchangeOf(msg Message) string {
 	return msg.exchangeName()
+}
+
+// IsRouted tells a driver which routing key shape the type uses. A type missing
+// RouteBy is routed and broken, never plain, so the defect cannot pass unseen.
+func IsRouted(msg Message) bool {
+	_, ok := msg.(interface{ routedMsg() })
+	return ok
+}
+
+// RouteOf returns the route the message picked. The false answer belongs to a
+// type that embeds the routed marker and never implemented RouteBy.
+func RouteOf(msg Message) (string, bool) {
+	routed, ok := msg.(RoutedMessage)
+	if !ok {
+		return "", false
+	}
+
+	return routed.RouteBy(), true
 }
 
 // Handler handles one concrete message type; a returned error triggers the

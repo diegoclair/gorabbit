@@ -134,7 +134,7 @@ func TestIntegrationPublishAndConsume(t *testing.T) {
 	correlationIDs := make(chan any, 1)
 
 	consumer := newConsumer[ordersExchange](t, "billing-queue")
-	require.NoError(t, RegisterHandler(ctx, consumer, orderCreated{},
+	require.NoError(t, Subscribe(ctx, consumer, orderCreated{},
 		func(ctx context.Context, msg orderCreated) error {
 			correlationIDs <- ctx.Value(testCarrierKey)
 			received <- msg
@@ -166,7 +166,7 @@ func TestIntegrationRetriesThenDeadLetters(t *testing.T) {
 		func(s *Setup[paymentsExchange]) *Setup[paymentsExchange] {
 			return s.WithRetry(2, 200*time.Millisecond, nil)
 		})
-	require.NoError(t, RegisterHandler(ctx, consumer, paymentRequested{},
+	require.NoError(t, Subscribe(ctx, consumer, paymentRequested{},
 		func(context.Context, paymentRequested) error {
 			attempts.Add(1)
 			return fmt.Errorf("always fails")
@@ -196,7 +196,7 @@ func TestIntegrationCachedMessagesAreFlushedOnConnect(t *testing.T) {
 	received := make(chan shipmentScheduled, 2)
 
 	consumer := newConsumer[shippingExchange](t, "shipping-queue")
-	require.NoError(t, RegisterHandler(ctx, consumer, shipmentScheduled{},
+	require.NoError(t, Subscribe(ctx, consumer, shipmentScheduled{},
 		func(_ context.Context, msg shipmentScheduled) error {
 			received <- msg
 			return nil
@@ -226,7 +226,7 @@ func TestIntegrationCachedMessagesAreFlushedOnConnect(t *testing.T) {
 		}
 	}
 
-	keys, err := cache.GetAllKeys(ctx, cacheKey("cached-producer", "")+"*")
+	keys, err := cache.GetAllKeys(ctx, cacheKey(producer.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Empty(t, keys, "published messages must leave the cache")
 }
@@ -253,7 +253,7 @@ func TestIntegrationSameTypeNameInDifferentExchanges(t *testing.T) {
 			ID string `json:"id"`
 		}
 
-		require.NoError(t, RegisterHandler(ctx, consumer, itemAdded{},
+		require.NoError(t, Subscribe(ctx, consumer, itemAdded{},
 			func(_ context.Context, msg itemAdded) error {
 				fromInvoices <- msg.ID
 				return nil
@@ -270,7 +270,7 @@ func TestIntegrationSameTypeNameInDifferentExchanges(t *testing.T) {
 			ID string `json:"id"`
 		}
 
-		require.NoError(t, RegisterHandler(ctx, consumer, itemAdded{},
+		require.NoError(t, Subscribe(ctx, consumer, itemAdded{},
 			func(_ context.Context, msg itemAdded) error {
 				fromCatalog <- msg.ID
 				return nil
@@ -297,7 +297,7 @@ func TestIntegrationPublishesPointerMessages(t *testing.T) {
 	received := make(chan string, 1)
 
 	consumer := newConsumer[warehouseExchange](t, "warehouse-queue")
-	require.NoError(t, RegisterHandler(ctx, consumer, stockReserved{},
+	require.NoError(t, Subscribe(ctx, consumer, stockReserved{},
 		func(_ context.Context, msg stockReserved) error {
 			received <- msg.SKU
 			return nil
@@ -321,7 +321,7 @@ type customerNotified struct {
 	ID string `json:"id"`
 }
 
-// The broker only comes up after Connect, RegisterHandler, Start and Publish:
+// The broker only comes up after Connect, Subscribe, Start and Publish:
 // the client must hold the message and the binding until the connection lands.
 func TestIntegrationOfflineClientDeliversOnceTheBrokerComesUp(t *testing.T) {
 	skipWithoutBroker(t)
@@ -341,7 +341,7 @@ func TestIntegrationOfflineClientDeliversOnceTheBrokerComesUp(t *testing.T) {
 	t.Cleanup(client.Close)
 	require.False(t, client.Connected())
 
-	require.NoError(t, RegisterHandler(ctx, client, customerNotified{},
+	require.NoError(t, Subscribe(ctx, client, customerNotified{},
 		func(_ context.Context, msg customerNotified) error {
 			received <- msg.ID
 			return nil
@@ -421,10 +421,16 @@ func startBrokerAt(t *testing.T, port int) {
 func waitForMessage(t *testing.T, messages <-chan string) string {
 	t.Helper()
 
+	return waitForMessageWithin(t, messages, 10*time.Second)
+}
+
+func waitForMessageWithin(t *testing.T, messages <-chan string, timeout time.Duration) string {
+	t.Helper()
+
 	select {
 	case msg := <-messages:
 		return msg
-	case <-time.After(10 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("timed out waiting for the message")
 		return ""
 	}

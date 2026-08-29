@@ -25,12 +25,49 @@ type auditedOrderCreated struct {
 	Auditor string `json:"auditor"`
 }
 
+type routedOrders = RoutedMsg[ordersExchange]
+
+type orderShipped struct {
+	routedOrders
+	Carrier string `json:"carrier"`
+}
+
+func (o orderShipped) RouteBy() string { return o.Carrier }
+
 func TestExchangeOfResolvesTheMarker(t *testing.T) {
 	require.Equal(t, "orders", ExchangeOf(orderCreated{}))
 	require.Equal(t, "orders", ExchangeOf(&orderCreated{}))
 
 	// Promotion crosses more than one level of embedding.
 	require.Equal(t, "orders", ExchangeOf(auditedOrderCreated{}))
+}
+
+func TestRoutedMarkerResolvesTheExchangeAndTheRoute(t *testing.T) {
+	require.Equal(t, "orders", ExchangeOf(orderShipped{}))
+
+	require.True(t, IsRouted(orderShipped{}))
+	require.False(t, IsRouted(orderCreated{}))
+
+	route, ok := RouteOf(orderShipped{Carrier: "correios"})
+	require.True(t, ok)
+	require.Equal(t, "correios", route)
+
+	_, ok = RouteOf(orderCreated{})
+	require.False(t, ok, "a plain message has no route to give")
+}
+
+// A type that embeds the routed marker and never implements RouteBy is routed
+// and broken, not plain: a driver must report it instead of routing it as if it
+// had no route.
+func TestRoutedMarkerWithoutRouteByIsStillRouted(t *testing.T) {
+	type eventRecorded struct {
+		routedOrders
+	}
+
+	require.True(t, IsRouted(eventRecorded{}))
+
+	_, ok := RouteOf(eventRecorded{})
+	require.False(t, ok)
 }
 
 func TestMarkerStaysOutOfTheJSONPayload(t *testing.T) {
@@ -61,12 +98,41 @@ func TestMarkerIsSealed(t *testing.T) {
 
 	_, hasMarshaler := any(Msg[ordersExchange]{}).(json.Marshaler)
 	require.False(t, hasMarshaler)
+
+	routedType := reflect.TypeOf(RoutedMsg[ordersExchange]{})
+
+	require.Zero(t, routedType.NumField())
+	require.Zero(t, routedType.NumMethod(), "no exported methods")
+	require.Zero(t, reflect.PointerTo(routedType).NumMethod())
 }
 
 // The whole point of the marker: a message without one is rejected by the
 // compiler, not by the broker at runtime.
 func TestMessageWithoutAMarkerDoesNotCompile(t *testing.T) {
 	require.Contains(t, buildTestdata(t, "nomarker"), "missing method exchangeName")
+}
+
+// The route is the message's own business, so the type has to say what it
+// routes by before anything can subscribe to one of its routes.
+func TestRoutedMessageWithoutRouteByDoesNotCompile(t *testing.T) {
+	require.Contains(t, buildTestdata(t, "missingrouteby"), "does not satisfy gorabbit.RoutedMessage")
+}
+
+// The whole point of the two markers: only a message that carries a route can
+// be sliced by one.
+func TestSubscribingARouteOfAPlainMessageDoesNotCompile(t *testing.T) {
+	require.Contains(t, buildTestdata(t, "plainroute"), "does not satisfy gorabbit.RoutedMessage")
+}
+
+// The marker, not RouteBy, is what a per-route subscription asks for: a plain
+// message declaring one would bind on the route and publish on the bare type.
+func TestPlainMessageDeclaringRouteByDoesNotCompile(t *testing.T) {
+	require.Contains(t, buildTestdata(t, "fakerouted"), "missing method routedMsg")
+}
+
+// One message, one exchange, one routing shape.
+func TestTwoMarkersDoNotCompile(t *testing.T) {
+	require.Contains(t, buildTestdata(t, "twomarkers"), "ambiguous selector")
 }
 
 // Ownership is compile-time too: a client publishes its own exchange only.

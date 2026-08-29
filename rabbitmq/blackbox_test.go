@@ -57,14 +57,14 @@ func TestServiceOwnsOneExchangeAndConsumesAnother(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(support.Close)
 
-	require.NoError(t, rabbitmq.RegisterHandler(ctx, support, TicketOpened{},
+	require.NoError(t, rabbitmq.Subscribe(ctx, support, TicketOpened{},
 		func(_ context.Context, msg TicketOpened) error {
 			tickets <- msg
 			return nil
 		}))
 
-	// A fact from another exchange: RegisterHandler takes it, Publish would not.
-	require.NoError(t, rabbitmq.RegisterHandler(ctx, support, orders.OrderCreated{},
+	// A fact from another exchange: Subscribe takes it, Publish would not.
+	require.NoError(t, rabbitmq.Subscribe(ctx, support, orders.OrderCreated{},
 		func(_ context.Context, msg orders.OrderCreated) error {
 			created <- msg
 			return nil

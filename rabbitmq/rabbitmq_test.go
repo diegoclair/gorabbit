@@ -184,11 +184,11 @@ func TestConnectWithUnreachableBrokerReturnsUsableClient(t *testing.T) {
 	require.False(t, c.Connected())
 
 	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "1"}))
-	keys, err := cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
+	keys, err := cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1, "an offline publish must land in the cache")
 
-	require.NoError(t, RegisterHandler(ctx, c, orderCreated{},
+	require.NoError(t, Subscribe(ctx, c, orderCreated{},
 		func(context.Context, orderCreated) error { return nil }))
 
 	c.handlersMu.RLock()
@@ -196,7 +196,7 @@ func TestConnectWithUnreachableBrokerReturnsUsableClient(t *testing.T) {
 	c.handlersMu.RUnlock()
 	require.True(t, registered, "an offline registration must wait for the connection")
 
-	info, err := cache.Get(ctx, c.handlerInfoCacheKey(handlerInfo{Exchange: "orders", RoutingKey: "orderCreated"}))
+	info, err := cache.Get(ctx, c.handlerInfoCacheKey(handlerInfo{Exchange: "orders", BindingKey: "orderCreated"}))
 	require.NoError(t, err)
 	require.NotEmpty(t, info, "the binding must be recorded even while disconnected")
 
@@ -277,7 +277,7 @@ func TestPublishRejectsANilMessage(t *testing.T) {
 
 	require.ErrorContains(t, c.Publish(ctx, (*orderCreated)(nil)), "message is nil")
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Empty(t, keys, "an unpublishable message must not reach the cache")
 }
@@ -286,8 +286,8 @@ func TestHandlerForUsesTheOriginExchangeOfRetriedMessages(t *testing.T) {
 	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	// Same message name in two exchanges: only the exchange tells them apart.
-	fromOrders := handlerInfo{Exchange: "orders", RoutingKey: "orderCreated"}
-	fromBilling := handlerInfo{Exchange: "billing", RoutingKey: "orderCreated"}
+	fromOrders := handlerInfo{Exchange: "orders", BindingKey: "orderCreated"}
+	fromBilling := handlerInfo{Exchange: "billing", BindingKey: "orderCreated"}
 	c.handlers[handlersMapKey("orders", "orderCreated")] = fromOrders
 	c.handlers[handlersMapKey("billing", "orderCreated")] = fromBilling
 
@@ -369,17 +369,33 @@ func TestStampOriginExchange(t *testing.T) {
 	require.Equal(t, "orders", second.Headers[originExchangeHeaderKey])
 }
 
-func TestCacheKey(t *testing.T) {
-	require.Equal(t, "gorabbit:cached_messages:app:", cacheKey("app", ""))
-	require.Equal(t, "gorabbit:cached_messages:app:0198b7ff", cacheKey("app", "0198b7ff"))
+// Two clients of one app on one exchange replay each other's messages unless
+// the queue that separates them is part of the key.
+func TestCacheKeyScope(t *testing.T) {
+	publisher := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
+	consumer := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+
+	require.Equal(t, "publisher:app:orders", publisher.cacheScope())
+	require.Equal(t, "consumer:app:orders:app-queue", consumer.cacheScope())
+	require.Equal(t, "gorabbit:cached_messages:publisher:app:orders:0198b7ff", cacheKey(publisher.cacheScope(), "0198b7ff"))
+
+	// The publisher glob must not reach the consumer's entries, which sit one
+	// segment deeper under a prefix of its own.
+	ctx := context.Background()
+	cache := gorabbit.NewMemoryCache()
+	require.NoError(t, cache.Set(ctx, cacheKey(consumer.cacheScope(), "0198b7ff"), []byte("{}"), 0))
+
+	keys, err := cache.GetAllKeys(ctx, cacheKey(publisher.cacheScope(), "")+"*")
+	require.NoError(t, err)
+	require.Empty(t, keys)
 }
 
 func TestHandlerKeys(t *testing.T) {
 	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
-	info := handlerInfo{Exchange: "orders", RoutingKey: "orderCreated"}
+	info := handlerInfo{Exchange: "orders", BindingKey: "orderCreated"}
 
-	require.Equal(t, "orders:orderCreated", handlersMapKey(info.Exchange, info.RoutingKey))
-	require.Equal(t, "gorabbit:handler-info:app-queue:orders:orderCreated", c.handlerInfoCacheKey(info))
+	require.Equal(t, "orders:orderCreated", handlersMapKey(info.Exchange, info.BindingKey))
+	require.Equal(t, "gorabbit:handler-info:consumer:app:orders:app-queue:orders:orderCreated", c.handlerInfoCacheKey(info))
 }
 
 func TestPublishCachesMessageWhenBrokerIsUnreachable(t *testing.T) {
@@ -388,7 +404,7 @@ func TestPublishCachesMessageWhenBrokerIsUnreachable(t *testing.T) {
 
 	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "123"}))
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 
@@ -441,12 +457,12 @@ func TestFlushCachedMessagesIsANoopWhileDisconnected(t *testing.T) {
 	// No channel is open, so a flush that did not check the connection would panic.
 	c.flushCachedMessages(ctx)
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 }
 
-func TestGetMessagesFromCacheReplaysInPublishOrderAndSkipsCorruptEntries(t *testing.T) {
+func TestCachedMessagesReplayInPublishOrderAndSkipCorruptEntries(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
 
@@ -459,16 +475,25 @@ func TestGetMessagesFromCacheReplaysInPublishOrderAndSkipsCorruptEntries(t *test
 	} {
 		data, err := json.Marshal(msg)
 		require.NoError(t, err)
-		require.NoError(t, c.cache.Set(ctx, cacheKey("app", msg.MsgID), data, 0))
+		require.NoError(t, c.cache.Set(ctx, cacheKey(c.cacheScope(), msg.MsgID), data, 0))
 	}
-	require.NoError(t, c.cache.Set(ctx, cacheKey("app", "corrupt"), []byte("not json"), 0))
+	require.NoError(t, c.cache.Set(ctx, cacheKey(c.cacheScope(), "corrupt"), []byte("not json"), 0))
 
-	messages, err := c.getMessagesFromCache(ctx)
+	keys, err := c.cachedMessageKeys(ctx)
 	require.NoError(t, err)
-	require.Len(t, messages, 3)
-	require.Equal(t, "first", messages[0].MsgTypeName)
-	require.Equal(t, "second", messages[1].MsgTypeName)
-	require.Equal(t, "third", messages[2].MsgTypeName)
+	require.Len(t, keys, 4)
+
+	var names []string
+	for _, key := range keys {
+		msg, ok := c.readCachedMessage(ctx, key)
+		if !ok {
+			continue
+		}
+		require.Equal(t, msg.MsgID, msgIDFromCacheKey(key))
+		names = append(names, msg.MsgTypeName)
+	}
+
+	require.Equal(t, []string{"first", "second", "third"}, names)
 }
 
 func TestRetryCountHeader(t *testing.T) {
@@ -539,30 +564,30 @@ func TestHandleMessageSafely(t *testing.T) {
 	})
 }
 
-func TestRegisterHandlerRejectsInvalidUsage(t *testing.T) {
+func TestSubscribeRejectsInvalidUsage(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("client is not a consumer", func(t *testing.T) {
 		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
-		err := RegisterHandler(ctx, c, orderCreated{}, func(context.Context, orderCreated) error { return nil })
+		err := Subscribe(ctx, c, orderCreated{}, func(context.Context, orderCreated) error { return nil })
 		require.ErrorContains(t, err, "not a consumer")
 	})
 
 	t.Run("nil handler", func(t *testing.T) {
 		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
-		err := RegisterHandler[orderCreated](ctx, c, orderCreated{}, nil)
+		err := Subscribe[orderCreated](ctx, c, orderCreated{}, nil)
 		require.ErrorContains(t, err, "handler is required")
 	})
 
 	t.Run("marker with an empty exchange name", func(t *testing.T) {
 		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
-		err := RegisterHandler(ctx, c, noExchangeName{}, func(context.Context, noExchangeName) error { return nil })
+		err := Subscribe(ctx, c, noExchangeName{}, func(context.Context, noExchangeName) error { return nil })
 		require.ErrorContains(t, err, "empty exchange name")
 	})
 
 	t.Run("nil message", func(t *testing.T) {
 		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
-		err := RegisterHandler(ctx, c, (*orderCreated)(nil), func(context.Context, *orderCreated) error { return nil })
+		err := Subscribe(ctx, c, (*orderCreated)(nil), func(context.Context, *orderCreated) error { return nil })
 		require.ErrorContains(t, err, "message is nil")
 	})
 }

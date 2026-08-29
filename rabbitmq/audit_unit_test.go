@@ -105,7 +105,7 @@ func TestAuditCloseStopsEveryBackgroundGoroutine(t *testing.T) {
 		WithReconnectDelay(50 * time.Millisecond).
 		Connect(gorabbit.NewMemoryCache())
 	require.NoError(t, err)
-	require.NoError(t, RegisterHandler(ctx, c, orderCreated{}, func(context.Context, orderCreated) error { return nil }))
+	require.NoError(t, Subscribe(ctx, c, orderCreated{}, func(context.Context, orderCreated) error { return nil }))
 	c.Start(ctx)
 	require.NoError(t, c.Publish(ctx, orderCreated{OrderID: "1"}))
 	time.Sleep(200 * time.Millisecond)
@@ -123,15 +123,15 @@ func TestAuditCloseStopsEveryBackgroundGoroutine(t *testing.T) {
 	require.False(t, c.Connected())
 }
 
-func TestAuditRegisterHandlerTwiceForSameRoutingKeyIsRejected(t *testing.T) {
+func TestAuditSubscribeTwiceForSameBindingKeyIsRejected(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	first := func(context.Context, orderCreated) error { return nil }
 	second := func(context.Context, orderCreated) error { return nil }
-	require.NoError(t, RegisterHandler(ctx, c, orderCreated{}, first))
+	require.NoError(t, Subscribe(ctx, c, orderCreated{}, first))
 
-	err := RegisterHandler(ctx, c, orderCreated{}, second)
+	err := Subscribe(ctx, c, orderCreated{}, second)
 	require.Error(t, err, "a second handler for the same (exchange, type name) silently replaces the first")
 }
 
@@ -144,12 +144,15 @@ func TestAuditPublishRejectsAMessageWithoutATypeName(t *testing.T) {
 		ID string `json:"id"`
 	}{ID: "1"}
 
-	pm, err := c.getPublishMessage(ctx, anonymous)
-	require.NoError(t, err)
-	t.Logf("routing key for an anonymous struct: %q", pm.MsgTypeName)
+	_, err := c.getPublishMessage(ctx, anonymous)
+	require.ErrorIs(t, err, errEmptyTypeName)
 
-	require.Error(t, c.Publish(ctx, anonymous),
+	require.ErrorIs(t, c.Publish(ctx, anonymous), errEmptyTypeName,
 		"an empty routing key can never match a binding, so the broker drops it and Publish still reports success")
+
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
+	require.NoError(t, err)
+	require.Empty(t, keys, "a message no binding can ever match must not sit in the cache")
 }
 
 // The entry must be identified by the message, never by the instant it was
@@ -167,12 +170,12 @@ func TestAuditCacheKeySurvivesTwoMessagesInTheSameNanosecond(t *testing.T) {
 	require.NoError(t, c.cacheMessage(ctx, first))
 	require.NoError(t, c.cacheMessage(ctx, second))
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Len(t, keys, 2, "the key carries the caching instant, so one message occupies as many entries as it was cached times")
 
-	require.Contains(t, keys, cacheKey("app", first.MsgID))
-	require.Contains(t, keys, cacheKey("app", second.MsgID))
+	require.Contains(t, keys, cacheKey(c.cacheScope(), first.MsgID))
+	require.Contains(t, keys, cacheKey(c.cacheScope(), second.MsgID))
 }
 
 // The monitor redialing into the same rejection is what a Publish meets here:
@@ -186,7 +189,7 @@ func TestAuditPublishReportsATopologyRejectionWhileTheMonitorRedials(t *testing.
 
 	require.ErrorIs(t, c.Publish(ctx, orderCreated{OrderID: "1"}), ErrTopologyRejected)
 
-	keys, err := c.cache.GetAllKeys(ctx, cacheKey("app", "")+"*")
+	keys, err := c.cache.GetAllKeys(ctx, cacheKey(c.cacheScope(), "")+"*")
 	require.NoError(t, err)
 	require.Empty(t, keys, "the message was cached with a 24h ttl behind an error only a deploy fixes")
 }
