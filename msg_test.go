@@ -140,6 +140,22 @@ func TestPublishingAnotherExchangeDoesNotCompile(t *testing.T) {
 	require.Contains(t, buildTestdata(t, "crossexchange"), "wrong type for method ownedBy")
 }
 
+// Retry, prefetch and the worker pool all need a queue, so they live on the
+// setup WithConsumer returns and a publisher cannot name them at all.
+func TestConsumerOptionsOnAPublisherDoNotCompile(t *testing.T) {
+	packages := map[string]string{
+		"publisherretry":       "WithRetry undefined (type *rabbitmq.Setup[",
+		"publisherprefetch":    "WithPrefetchCount undefined (type *rabbitmq.Setup[",
+		"publisherconcurrency": "WithConcurrency undefined (type *rabbitmq.Setup[",
+	}
+
+	for pkg, want := range packages {
+		t.Run(pkg, func(t *testing.T) {
+			require.Contains(t, buildTestdata(t, pkg), want)
+		})
+	}
+}
+
 func buildTestdata(t *testing.T, pkg string) string {
 	t.Helper()
 

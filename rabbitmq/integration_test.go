@@ -163,7 +163,7 @@ func TestIntegrationRetriesThenDeadLetters(t *testing.T) {
 	var attempts atomic.Int32
 
 	consumer := newConsumer[paymentsExchange](t, "payments-queue",
-		func(s *Setup[paymentsExchange]) *Setup[paymentsExchange] {
+		func(s *ConsumerSetup[paymentsExchange]) *ConsumerSetup[paymentsExchange] {
 			return s.WithRetry(2, 200*time.Millisecond, nil)
 		})
 	require.NoError(t, Subscribe(ctx, consumer, paymentRequested{},
@@ -446,7 +446,7 @@ func newProducer[E gorabbit.Exchange](t *testing.T, cache gorabbit.Cache) *Clien
 	return c
 }
 
-func newConsumer[E gorabbit.Exchange](t *testing.T, queue string, opts ...func(*Setup[E]) *Setup[E]) *Client[E] {
+func newConsumer[E gorabbit.Exchange](t *testing.T, queue string, opts ...func(*ConsumerSetup[E]) *ConsumerSetup[E]) *Client[E] {
 	t.Helper()
 
 	setup := NewSetup[E](brokerURL, queue).

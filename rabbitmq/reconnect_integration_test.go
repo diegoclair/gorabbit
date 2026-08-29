@@ -96,17 +96,22 @@ func startBroker(t *testing.T, broker *testcontainers.DockerContainer, port int)
 
 // The app name carries the test name: these run in parallel and two clients of
 // one process may not share a cache key.
-func newOutageClient(t *testing.T, port int, consumer bool, opts ...func(*Setup[outageExchange]) *Setup[outageExchange]) *Client[outageExchange] {
+func newOutageClient(t *testing.T, port int, consumer bool, opts ...func(*ConsumerSetup[outageExchange]) *ConsumerSetup[outageExchange]) *Client[outageExchange] {
 	t.Helper()
 
-	setup := NewSetup[outageExchange](brokerURLAt(port), t.Name()).
+	publisher := NewSetup[outageExchange](brokerURLAt(port), t.Name()).
 		WithDialTimeout(testDialTimeout).
 		WithReconnectDelay(testReconnectWait)
+
+	var setup interface {
+		Connect(gorabbit.Cache) (*Client[outageExchange], error)
+	} = publisher
 	if consumer {
-		setup = setup.WithConsumer("outage-queue")
-	}
-	for _, opt := range opts {
-		setup = opt(setup)
+		s := publisher.WithConsumer("outage-queue")
+		for _, opt := range opts {
+			s = opt(s)
+		}
+		setup = s
 	}
 
 	c, err := setup.Connect(gorabbit.NewMemoryCache())
@@ -427,7 +432,7 @@ func TestReconnectRetryInFlightSurvivesBrokerRestart(t *testing.T) {
 	firstFailed := make(chan struct{}, 1)
 	handled := make(chan string, 4)
 
-	client := newOutageClient(t, port, true, func(s *Setup[outageExchange]) *Setup[outageExchange] {
+	client := newOutageClient(t, port, true, func(s *ConsumerSetup[outageExchange]) *ConsumerSetup[outageExchange] {
 		return s.WithRetry(3, 4*time.Second, nil)
 	})
 	require.NoError(t, Subscribe(ctx, client, outageEvent{},

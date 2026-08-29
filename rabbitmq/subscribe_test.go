@@ -27,26 +27,26 @@ func TestSubscriptionsBindTheKeyThatMatchesTheirScope(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("a plain message binds its type name", func(t *testing.T) {
-		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		require.NoError(t, Subscribe(ctx, c, orderCreated{}, func(context.Context, orderCreated) error { return nil }))
 		require.Equal(t, []string{"orderCreated"}, bindingKeys(c))
 	})
 
 	t.Run("every route of a routed message", func(t *testing.T) {
-		c := newTestClient(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		require.NoError(t, Subscribe(ctx, c, eventRecorded{}, func(context.Context, eventRecorded) error { return nil }))
 		require.Equal(t, []string{"eventRecorded.#"}, bindingKeys(c))
 	})
 
 	t.Run("one route of a routed message", func(t *testing.T) {
-		c := newTestClient(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		require.NoError(t, SubscribeRoute(ctx, c, eventRecorded{}, "shopee",
 			func(context.Context, eventRecorded) error { return nil }))
 		require.Equal(t, []string{"eventRecorded.shopee"}, bindingKeys(c))
 	})
 
 	t.Run("a route carrying the topic metacharacters", func(t *testing.T) {
-		c := newTestClient(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		require.NoError(t, SubscribeRoute(ctx, c, eventRecorded{}, "mercado.livre",
 			func(context.Context, eventRecorded) error { return nil }))
 		require.Equal(t, []string{"eventRecorded.mercado%2Elivre"}, bindingKeys(c))
@@ -57,7 +57,7 @@ func TestSubscriptionsBindTheKeyThatMatchesTheirScope(t *testing.T) {
 // the duplicate check has to be about the binding and not about the type.
 func TestSubscribeRouteAcceptsSeveralRoutesOfTheSameType(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	handler := func(context.Context, eventRecorded) error { return nil }
 	require.NoError(t, SubscribeRoute(ctx, c, eventRecorded{}, "shopee", handler))
@@ -69,7 +69,7 @@ func TestSubscribeRouteAcceptsSeveralRoutesOfTheSameType(t *testing.T) {
 
 func TestHandlerForResolvesTheRouteOfADelivery(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	require.NoError(t, SubscribeRoute(ctx, c, eventRecorded{}, "shopee",
 		func(context.Context, eventRecorded) error { return nil }))

@@ -81,38 +81,14 @@ func NewSetup[E gorabbit.Exchange](amqpURL, appName string) *Setup[E] {
 }
 
 // WithConsumer declares the queue this application consumes from, plus its
-// dead-letter queue.
-func (s *Setup[E]) WithConsumer(queueName string) *Setup[E] {
+// dead-letter queue. It hands back the consumer setup, which is the only place
+// the options that need a queue can be written.
+func (s *Setup[E]) WithConsumer(queueName string) *ConsumerSetup[E] {
 	s.queueName = queueName
 	s.dlqName = fmt.Sprintf("%s.dlq", queueName)
 	s.retryName = fmt.Sprintf("%s.retry", queueName)
 	s.isConsumer = true
-	return s
-}
-
-// WithRetry sets how many times a failed message is retried before going to the
-// dead-letter queue, and how long it waits between attempts. retryableErrorFunc
-// decides which errors are worth retrying; nil retries every error.
-func (s *Setup[E]) WithRetry(retryCount int, retryInterval time.Duration, retryableErrorFunc func(error) bool) *Setup[E] {
-	s.retryCount = retryCount
-	s.retryInterval = retryInterval
-	s.withRetry = true
-	s.retryableErrorFunc = retryableErrorFunc
-	return s
-}
-
-// WithPrefetchCount limits how many unacknowledged messages the broker delivers
-// to this consumer at once.
-func (s *Setup[E]) WithPrefetchCount(count int) *Setup[E] {
-	s.preFetchCount = count
-	return s
-}
-
-// WithConcurrency sets how many deliveries this client handles at once, across
-// every handler it registered. Above 1 the order of the queue is not preserved.
-func (s *Setup[E]) WithConcurrency(n int) *Setup[E] {
-	s.concurrency = n
-	return s
+	return &ConsumerSetup[E]{setup: s}
 }
 
 func (s *Setup[E]) WithLogger(l gorabbit.Logger) *Setup[E] {
@@ -162,8 +138,6 @@ func (s *Setup[E]) validate() error {
 		return errors.New("gorabbit: exchange name is required")
 	case s.appName == "":
 		return errors.New("gorabbit: app name is required")
-	case s.withRetry && !s.isConsumer:
-		return errors.New("gorabbit: retry is only available for consumers")
 	case s.withRetry && s.retryCount <= 0:
 		return errors.New("gorabbit: retry count must be greater than zero")
 	case s.withRetry && s.retryInterval <= 0:
@@ -172,8 +146,6 @@ func (s *Setup[E]) validate() error {
 		return errors.New("gorabbit: publish confirm timeout must be greater than zero")
 	case s.concurrency < 1:
 		return errors.New("gorabbit: concurrency must be greater than zero")
-	case s.concurrency > 1 && !s.isConsumer:
-		return errors.New("gorabbit: concurrency is only available for consumers")
 	// A prefetch of zero is AMQP's unlimited; anything else below the
 	// concurrency leaves workers that could never hold a delivery.
 	case s.preFetchCount > 0 && s.concurrency > s.preFetchCount:
@@ -181,6 +153,70 @@ func (s *Setup[E]) validate() error {
 	}
 
 	return nil
+}
+
+// ConsumerSetup is a Setup that has a queue. Retry, prefetch and concurrency
+// are meaningless without one, so they live here and a publisher cannot name
+// them.
+type ConsumerSetup[E gorabbit.Exchange] struct {
+	setup *Setup[E]
+}
+
+// WithRetry sets how many times a failed message is retried before going to the
+// dead-letter queue, and how long it waits between attempts. retryableErrorFunc
+// decides which errors are worth retrying; nil retries every error.
+func (c *ConsumerSetup[E]) WithRetry(retryCount int, retryInterval time.Duration, retryableErrorFunc func(error) bool) *ConsumerSetup[E] {
+	c.setup.retryCount = retryCount
+	c.setup.retryInterval = retryInterval
+	c.setup.withRetry = true
+	c.setup.retryableErrorFunc = retryableErrorFunc
+	return c
+}
+
+// WithPrefetchCount limits how many unacknowledged messages the broker delivers
+// to this consumer at once.
+func (c *ConsumerSetup[E]) WithPrefetchCount(count int) *ConsumerSetup[E] {
+	c.setup.preFetchCount = count
+	return c
+}
+
+// WithConcurrency sets how many deliveries this client handles at once, across
+// every handler it registered. Above 1 the order of the queue is not preserved.
+func (c *ConsumerSetup[E]) WithConcurrency(n int) *ConsumerSetup[E] {
+	c.setup.concurrency = n
+	return c
+}
+
+// The methods common to any setup are repeated here, and not embedded, so a
+// chain that started with WithConsumer is still a consumer setup at the end.
+
+func (c *ConsumerSetup[E]) WithLogger(l gorabbit.Logger) *ConsumerSetup[E] {
+	c.setup.WithLogger(l)
+	return c
+}
+
+func (c *ConsumerSetup[E]) WithHeaderCarrier(h gorabbit.HeaderCarrier) *ConsumerSetup[E] {
+	c.setup.WithHeaderCarrier(h)
+	return c
+}
+
+func (c *ConsumerSetup[E]) WithReconnectDelay(d time.Duration) *ConsumerSetup[E] {
+	c.setup.WithReconnectDelay(d)
+	return c
+}
+
+func (c *ConsumerSetup[E]) WithDialTimeout(d time.Duration) *ConsumerSetup[E] {
+	c.setup.WithDialTimeout(d)
+	return c
+}
+
+func (c *ConsumerSetup[E]) WithPublishConfirmTimeout(d time.Duration) *ConsumerSetup[E] {
+	c.setup.WithPublishConfirmTimeout(d)
+	return c
+}
+
+func (c *ConsumerSetup[E]) Connect(cache gorabbit.Cache) (*Client[E], error) {
+	return c.setup.Connect(cache)
 }
 
 // The connection and its channels are swapped in as one: a client holding

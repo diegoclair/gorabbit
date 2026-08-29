@@ -116,7 +116,7 @@ func TestPublishRefusesARoutingKeyThatDoesNotFit(t *testing.T) {
 }
 
 func TestSubscribeRouteRefusesARoutingKeyThatDoesNotFit(t *testing.T) {
-	c := newTestClient(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[vendorsExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	err := SubscribeRoute(t.Context(), c, eventRecorded{}, strings.Repeat("v", maxRoutingKeyBytes),
 		func(context.Context, eventRecorded) error { return nil })

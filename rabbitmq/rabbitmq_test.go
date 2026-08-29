@@ -55,6 +55,10 @@ func newTestClient[E gorabbit.Exchange](setup *Setup[E]) *Client[E] {
 	return newClient(setup, gorabbit.NewMemoryCache())
 }
 
+func newTestConsumer[E gorabbit.Exchange](setup *ConsumerSetup[E]) *Client[E] {
+	return newClient(setup.setup, gorabbit.NewMemoryCache())
+}
+
 func TestSetupValidate(t *testing.T) {
 	// Setups of different exchanges are different types; validate is what the
 	// table needs from all of them.
@@ -69,7 +73,7 @@ func TestSetupValidate(t *testing.T) {
 		},
 		{
 			name:  "valid consumer with retry",
-			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue").WithRetry(3, time.Second, nil),
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue").WithRetry(3, time.Second, nil).setup,
 		},
 		{
 			name:    "missing amqp url",
@@ -87,18 +91,13 @@ func TestSetupValidate(t *testing.T) {
 			wantErr: "app name is required",
 		},
 		{
-			name:    "retry without consumer",
-			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithRetry(3, time.Second, nil),
-			wantErr: "retry is only available for consumers",
-		},
-		{
 			name:    "retry without count",
-			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(0, time.Second, nil),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(0, time.Second, nil).setup,
 			wantErr: "retry count must be greater than zero",
 		},
 		{
 			name:    "retry without interval",
-			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(3, 0, nil),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithRetry(3, 0, nil).setup,
 			wantErr: "retry interval must be greater than zero",
 		},
 		{
@@ -108,31 +107,26 @@ func TestSetupValidate(t *testing.T) {
 		},
 		{
 			name:    "concurrency below one",
-			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithConcurrency(0),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithConcurrency(0).setup,
 			wantErr: "concurrency must be greater than zero",
 		},
 		{
-			name:    "concurrency on a client that is not a consumer",
-			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConcurrency(2),
-			wantErr: "concurrency is only available for consumers",
-		},
-		{
 			name:    "concurrency above the prefetch count",
-			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(2).WithConcurrency(3),
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(2).WithConcurrency(3).setup,
 			wantErr: "concurrency must not be greater than the prefetch count",
 		},
 		{
 			name:  "concurrency equal to the prefetch count",
-			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(3).WithConcurrency(3),
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(3).WithConcurrency(3).setup,
 		},
 		{
 			// Zero prefetch is AMQP's unlimited, so it bounds no pool.
 			name:  "concurrency above one with no prefetch count",
-			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithConcurrency(8),
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithConcurrency(8).setup,
 		},
 		{
 			name:  "serial consumer with a prefetch of one",
-			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(1),
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(1).setup,
 		},
 	}
 
@@ -157,7 +151,7 @@ func TestSetupBuilders(t *testing.T) {
 		WithPrefetchCount(10).
 		WithConcurrency(4).
 		WithReconnectDelay(time.Minute).
-		WithPublishConfirmTimeout(3 * time.Second)
+		WithPublishConfirmTimeout(3 * time.Second).setup
 
 	require.True(t, s.isConsumer)
 	require.Equal(t, "app-queue", s.queueName)
@@ -314,7 +308,7 @@ func TestPublishRejectsANilMessage(t *testing.T) {
 }
 
 func TestHandlerForUsesTheOriginExchangeOfRetriedMessages(t *testing.T) {
-	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	// Same message name in two exchanges: only the exchange tells them apart.
 	fromOrders := handlerInfo{Exchange: "orders", BindingKey: "orderCreated"}
@@ -387,7 +381,7 @@ func TestHandlerForUsesTheOriginExchangeOfRetriedMessages(t *testing.T) {
 }
 
 func TestStampOriginExchange(t *testing.T) {
-	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	first := amqp091.Delivery{Exchange: "orders", Headers: amqp091.Table{}}
 	c.stampOriginExchange(&first)
@@ -404,7 +398,7 @@ func TestStampOriginExchange(t *testing.T) {
 // the queue that separates them is part of the key.
 func TestCacheKeyScope(t *testing.T) {
 	publisher := newTestClient(NewSetup[ordersExchange](unreachableURL, "app"))
-	consumer := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	consumer := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	require.Equal(t, "publisher:app:orders", publisher.cacheScope())
 	require.Equal(t, "consumer:app:orders:app-queue", consumer.cacheScope())
@@ -422,7 +416,7 @@ func TestCacheKeyScope(t *testing.T) {
 }
 
 func TestHandlerKeys(t *testing.T) {
-	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 	info := handlerInfo{Exchange: "orders", BindingKey: "orderCreated"}
 
 	require.Equal(t, "orders:orderCreated", handlersMapKey(info.Exchange, info.BindingKey))
@@ -605,19 +599,19 @@ func TestSubscribeRejectsInvalidUsage(t *testing.T) {
 	})
 
 	t.Run("nil handler", func(t *testing.T) {
-		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		err := Subscribe[orderCreated](ctx, c, orderCreated{}, nil)
 		require.ErrorContains(t, err, "handler is required")
 	})
 
 	t.Run("marker with an empty exchange name", func(t *testing.T) {
-		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		err := Subscribe(ctx, c, noExchangeName{}, func(context.Context, noExchangeName) error { return nil })
 		require.ErrorContains(t, err, "empty exchange name")
 	})
 
 	t.Run("nil message", func(t *testing.T) {
-		c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+		c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 		err := Subscribe(ctx, c, (*orderCreated)(nil), func(context.Context, *orderCreated) error { return nil })
 		require.ErrorContains(t, err, "message is nil")
 	})

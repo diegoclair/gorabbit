@@ -209,7 +209,7 @@ func TestAuditCancellingStartContextDoesNotDropConnectedState(t *testing.T) {
 	deleteQueue(t, queue)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := newConsumer[auditCancelExchange](t, queue, func(s *Setup[auditCancelExchange]) *Setup[auditCancelExchange] {
+	c := newConsumer[auditCancelExchange](t, queue, func(s *ConsumerSetup[auditCancelExchange]) *ConsumerSetup[auditCancelExchange] {
 		// No redial may run during the window, or it would hide the drop by
 		// healing it.
 		return s.WithReconnectDelay(30 * time.Second).WithLogger(auditLogger{t})
@@ -354,7 +354,7 @@ func TestAuditBindOnConsumerChannelWhileDeadLettering(t *testing.T) {
 	bindErrs := &distinctErrors{seen: map[string]int{}}
 	var binds atomic.Int64
 
-	c := newConsumer[auditHammerExchange](t, "audit-hammer-queue", func(s *Setup[auditHammerExchange]) *Setup[auditHammerExchange] {
+	c := newConsumer[auditHammerExchange](t, "audit-hammer-queue", func(s *ConsumerSetup[auditHammerExchange]) *ConsumerSetup[auditHammerExchange] {
 		return s.WithRetry(1, 50*time.Millisecond, nil).WithPrefetchCount(50).WithLogger(errs)
 	})
 	require.NoError(t, Subscribe(ctx, c, auditHammerEvent{}, func(context.Context, auditHammerEvent) error {
@@ -646,7 +646,7 @@ func TestAuditChangedRetryIntervalIsSurfacedInsteadOfCachingForever(t *testing.T
 	// run, which decides which of the two clients below is refused.
 	deleteQueue(t, "audit-topology-queue.retry")
 
-	old := newConsumer[auditTopologyExchange](t, "audit-topology-queue", func(s *Setup[auditTopologyExchange]) *Setup[auditTopologyExchange] {
+	old := newConsumer[auditTopologyExchange](t, "audit-topology-queue", func(s *ConsumerSetup[auditTopologyExchange]) *ConsumerSetup[auditTopologyExchange] {
 		return s.WithRetry(1, time.Second, nil)
 	})
 	require.True(t, old.Connected())
@@ -706,7 +706,7 @@ func TestAuditTopologyRejectedOnARedialIsSurfacedInsteadOfCaching(t *testing.T) 
 	ctx := context.Background()
 	deleteQueue(t, queue+".retry")
 
-	c := newConsumer[auditTopologyExchange](t, queue, func(s *Setup[auditTopologyExchange]) *Setup[auditTopologyExchange] {
+	c := newConsumer[auditTopologyExchange](t, queue, func(s *ConsumerSetup[auditTopologyExchange]) *ConsumerSetup[auditTopologyExchange] {
 		// Long enough that the monitor never redials during the test: the
 		// assertions are about the dial Publish itself drives.
 		return s.WithRetry(1, time.Second, nil).WithReconnectDelay(time.Hour).WithLogger(auditLogger{t})
@@ -739,7 +739,7 @@ func TestAuditTopologyRejectionHealsFromTheMonitorAlone(t *testing.T) {
 	ctx := context.Background()
 	deleteQueue(t, queue+".retry")
 
-	c := newConsumer[auditTopologyExchange](t, queue, func(s *Setup[auditTopologyExchange]) *Setup[auditTopologyExchange] {
+	c := newConsumer[auditTopologyExchange](t, queue, func(s *ConsumerSetup[auditTopologyExchange]) *ConsumerSetup[auditTopologyExchange] {
 		return s.WithRetry(1, time.Second, nil).WithReconnectDelay(200 * time.Millisecond).WithLogger(auditLogger{t})
 	})
 	require.True(t, c.Connected())

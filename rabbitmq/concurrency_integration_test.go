@@ -228,7 +228,7 @@ func TestConcurrencyWorkersRunAtTheSameTime(t *testing.T) {
 	allArrived := make(chan struct{})
 
 	consumer := newConsumer[concurrencyExchange](t, "concurrency-parallel-queue",
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(workers).WithConcurrency(workers)
 		})
 
@@ -267,7 +267,7 @@ func TestConcurrencyDefaultsToOneDeliveryAtATime(t *testing.T) {
 	// The prefetch has to be able to hand more than one delivery over, or the
 	// broker, not the consumer, is what keeps the second out of a handler.
 	consumer := newConsumer[concurrencyExchange](t, "concurrency-serial-queue",
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(published)
 		})
 
@@ -314,7 +314,7 @@ func TestConcurrencyPoolIsBounded(t *testing.T) {
 	held := make(chan struct{})
 
 	consumer := newConsumer[concurrencyExchange](t, "concurrency-bounded-queue",
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(published).WithConcurrency(workers)
 		})
 
@@ -433,7 +433,7 @@ func TestConcurrencyDeliversEveryMessageOnceAndDrainsTheQueue(t *testing.T) {
 	received := make(chan string, published*4)
 
 	consumer := newConsumer[concurrencyExchange](t, queue,
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(workers * 2).WithConcurrency(workers)
 		})
 	require.NoError(t, Subscribe(ctx, consumer, exactlyOnceEvent{},
@@ -465,7 +465,7 @@ func TestConcurrencyContextCancelStopsConsumingAndKeepsTheConnection(t *testing.
 	var cancelled atomic.Bool
 
 	consumer := newConsumer[concurrencyExchange](t, queue,
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(4).WithConcurrency(2).
 				WithReconnectDelay(testReconnectWait).
 				WithLogger(logger)
@@ -517,7 +517,7 @@ func TestConcurrencyCloseFinishesTheDeliveryInFlight(t *testing.T) {
 	held := make(chan struct{})
 
 	consumer := newConsumer[concurrencyExchange](t, queue,
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(2).WithConcurrency(2)
 		})
 
@@ -574,7 +574,7 @@ func TestConcurrencyOnePoolServesEverySubscription(t *testing.T) {
 	held := make(chan struct{})
 
 	consumer := newConsumer[concurrencyExchange](t, "concurrency-shared-pool-queue",
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithPrefetchCount(published).WithConcurrency(workers)
 		})
 
@@ -629,7 +629,7 @@ func TestConcurrencyCloseIsNotAConsumeFailure(t *testing.T) {
 	logger := &recordingLogger{}
 
 	consumer := newConsumer[concurrencyExchange](t, "concurrency-shutdown-queue",
-		func(s *Setup[concurrencyExchange]) *Setup[concurrencyExchange] {
+		func(s *ConsumerSetup[concurrencyExchange]) *ConsumerSetup[concurrencyExchange] {
 			return s.WithLogger(logger)
 		})
 	require.NoError(t, Subscribe(ctx, consumer, shutdownEvent{},

@@ -125,7 +125,7 @@ func TestAuditCloseStopsEveryBackgroundGoroutine(t *testing.T) {
 
 func TestAuditSubscribeTwiceForSameBindingKeyIsRejected(t *testing.T) {
 	ctx := context.Background()
-	c := newTestClient(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
+	c := newTestConsumer(NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("app-queue"))
 
 	first := func(context.Context, orderCreated) error { return nil }
 	second := func(context.Context, orderCreated) error { return nil }

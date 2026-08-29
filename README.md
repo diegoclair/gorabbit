@@ -95,7 +95,7 @@ and consumes facts from any other.
 
 ```go
 client, err := rabbitmq.NewSetup[orders.Exchange](amqpURL, "order-service").
-    WithConsumer("order-service").             // queue name
+    WithConsumer("order-service").             // queue name; the three below need it
     WithRetry(3, 30*time.Second, isRetryable). // retries before the DLQ
     WithPrefetchCount(10).                     // deliveries buffered in advance
     WithConcurrency(4).                        // handlers running at once
@@ -175,14 +175,30 @@ the handler that owns it.
 | Option | Effect |
 | --- | --- |
 | `WithConsumer(queue)` | Consume from `queue`; also declares `<queue>.dlq` and `<queue>.retry` |
-| `WithRetry(count, interval, isRetryable)` | Retry failed messages before dead-lettering; `nil` retries every error |
-| `WithPrefetchCount(n)` | Unacknowledged messages the broker delivers at once |
-| `WithConcurrency(n)` | Deliveries this client handles at once (default 1) |
 | `WithLogger(l)` | Structured logging (noop by default) |
 | `WithHeaderCarrier(h)` | Propagate context values as message headers |
 | `WithReconnectDelay(d)` | Wait between reconnection attempts (default 2s) |
 | `WithDialTimeout(d)` | Bound each connection attempt (default: the amqp091 30s) |
 | `WithPublishConfirmTimeout(d)` | Bound the wait for the broker's publish confirmation (default 5s) |
+
+### The options that need a queue
+
+`WithConsumer` returns a **consumer setup**, and these three exist only on it:
+
+| Option | Effect |
+| --- | --- |
+| `WithRetry(count, interval, isRetryable)` | Retry failed messages before dead-lettering; `nil` retries every error |
+| `WithPrefetchCount(n)` | Unacknowledged messages the broker delivers at once |
+| `WithConcurrency(n)` | Deliveries this client handles at once (default 1) |
+
+So they come **after** `WithConsumer` in the chain, and a client that does not
+consume cannot name them at all: `NewSetup[orders.Exchange](url, app).WithConcurrency(4)`
+does not compile. The mistake is caught where it is written — never at `Connect`,
+never silently. The options in the first table are on the consumer setup too, so
+the rest of the chain reads the same either way.
+
+The numbers themselves are checked at `Connect`: a concurrency below one, and a
+concurrency above a prefetch that bounds it, are values no type can catch.
 
 ### Concurrency and prefetch
 
@@ -207,6 +223,9 @@ at a time, whatever the prefetch.
   are checked out and no other replica can have them, so a large prefetch behind
   a small pool is one replica hoarding work the others were free to do. Keep it
   near the concurrency and let the queue hold the rest.
+- **Both are written on the consumer setup**, after `WithConsumer` — see
+  [Options](#the-options-that-need-a-queue). A publisher naming either of them
+  does not compile.
 
 The number itself comes from the ceiling downstream — the size of a database
 pool, a vendor's rate limit per application — never from the queue depth.

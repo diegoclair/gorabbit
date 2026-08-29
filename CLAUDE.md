@@ -16,8 +16,8 @@ a refused topology stops the boot, and an outage is a state rather than an error
   `HeaderCarrier`, plus the in-memory cache.
 - `rabbitmq` — the RabbitMQ driver: setup, connection lifecycle, publishing with
   confirms and returns, consuming, retry and dead-lettering, route encoding.
-- `testdata` — message packages the tests use, including the ones that must not
-  compile.
+- `testdata` — packages the tests build against the library, including the ones
+  that must not compile.
 - `e2e` — a separate Go module holding the end-to-end harness. It is not part of
   the library's module, so `go build ./...` and `go test ./...` at the root do
   not see it and the library keeps no example dependency.
@@ -68,10 +68,17 @@ Prefetch and concurrency are different things and both belong to the caller.
 the broker pushes in advance, and therefore how many this consumer checks out of
 the queue where no other replica can reach them. `WithConcurrency` is the worker
 pool — how many deliveries are inside a handler at once. Neither is derived from
-the other: a setup that cannot work (a pool wider than a prefetch that bounds it,
-concurrency above one on a client that does not consume) is refused at
+the other: a pool wider than the prefetch that bounds it is refused at
 `validate`, never rewritten behind the caller.
 
+- **An option that needs a queue lives on the type `WithConsumer` returns**, so
+  a client that does not consume cannot name it and the mistake is a compile
+  error rather than a boot failure. That type repeats the options common to
+  every setup instead of embedding, or a chain would stop being a consumer setup
+  halfway. The order this imposes — `WithConsumer` first — is part of the API.
+- **`validate` keeps the checks on values only.** A rule the type system already
+  makes unwritable is a branch no test can reach, so it does not belong there;
+  a number out of range is not something a type catches, so it does.
 - **The pool belongs to the client, not to a subscription.** One set of
   goroutines reads the single delivery channel and serves every registered
   handler. Partitioning by key is the one thing that could restore order across
@@ -123,3 +130,6 @@ Anything else belongs in the suite, where it is cheaper and faster.
   mechanism that was not the real one.
 - Never synchronise with `time.Sleep`. Wait for a condition, with a timeout that
   fails saying what it was waiting for and what it last saw.
+- A guarantee the API makes at compile time is proved by a package under
+  `testdata` that must not build, and a test that builds it and asserts the
+  compiler's own message. A rule with no such package is only a claim.

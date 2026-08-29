@@ -172,7 +172,7 @@ func TestIntegrationRetryKeepsTheRouteOfTheMessage(t *testing.T) {
 		received := delivered[id]
 
 		consumer := newConsumer[retryRouteExchange](t, queue,
-			func(s *Setup[retryRouteExchange]) *Setup[retryRouteExchange] {
+			func(s *ConsumerSetup[retryRouteExchange]) *ConsumerSetup[retryRouteExchange] {
 				return s.WithRetry(2, 300*time.Millisecond, nil)
 			})
 
