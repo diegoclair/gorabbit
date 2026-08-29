@@ -97,7 +97,8 @@ and consumes facts from any other.
 client, err := rabbitmq.NewSetup[orders.Exchange](amqpURL, "order-service").
     WithConsumer("order-service").             // queue name
     WithRetry(3, 30*time.Second, isRetryable). // retries before the DLQ
-    WithPrefetchCount(10).
+    WithPrefetchCount(10).                     // deliveries buffered in advance
+    WithConcurrency(4).                        // handlers running at once
     Connect(gorabbit.NewMemoryCache())
 if err != nil {
     log.Fatal(err) // an invalid setup or a refused topology; an outage is not an error
@@ -176,11 +177,39 @@ the handler that owns it.
 | `WithConsumer(queue)` | Consume from `queue`; also declares `<queue>.dlq` and `<queue>.retry` |
 | `WithRetry(count, interval, isRetryable)` | Retry failed messages before dead-lettering; `nil` retries every error |
 | `WithPrefetchCount(n)` | Unacknowledged messages the broker delivers at once |
+| `WithConcurrency(n)` | Deliveries this client handles at once (default 1) |
 | `WithLogger(l)` | Structured logging (noop by default) |
 | `WithHeaderCarrier(h)` | Propagate context values as message headers |
 | `WithReconnectDelay(d)` | Wait between reconnection attempts (default 2s) |
 | `WithDialTimeout(d)` | Bound each connection attempt (default: the amqp091 30s) |
 | `WithPublishConfirmTimeout(d)` | Bound the wait for the broker's publish confirmation (default 5s) |
+
+### Concurrency and prefetch
+
+Two knobs, two questions. `WithPrefetchCount(n)` is the transport buffer: how
+many unacknowledged deliveries the broker hands over in advance.
+`WithConcurrency(n)` is the pool: how many of them are inside a handler at the
+same time, across every subscription of the client. The default is one delivery
+at a time, whatever the prefetch.
+
+- **Above 1, the handler runs in several goroutines at the same time.** Whatever
+  it touches — a map, a counter, a client of its own — has to be safe for
+  concurrent use; nothing is serialised on the way in.
+- **The order of the queue is not preserved, under concurrency or under retry.**
+  Two deliveries in two workers finish in whatever order their handlers take, and
+  a retried message comes back behind the newer ones even with a concurrency of
+  one — see [Ordering](#ordering).
+- **The prefetch has to be at least the concurrency**, or there are workers that
+  could never hold a delivery. `Connect` refuses that setup instead of picking a
+  prefetch you did not ask for. A prefetch of zero is AMQP's *unlimited* and goes
+  with any pool.
+- **The prefetch is what this consumer takes out of the queue.** Those messages
+  are checked out and no other replica can have them, so a large prefetch behind
+  a small pool is one replica hoarding work the others were free to do. Keep it
+  near the concurrency and let the queue hold the rest.
+
+The number itself comes from the ceiling downstream — the size of a database
+pool, a vendor's rate limit per application — never from the queue depth.
 
 ## Design: a neutral port and a driver
 
@@ -397,9 +426,21 @@ func (correlationCarrier) ToContext(ctx context.Context, headers map[string]any)
 
 ## Ordering
 
-Ordering is not handled here: with more than one consumer on a queue, two
-messages may be processed concurrently and out of order. Ordering requires Single
-Active Consumer plus a partitioning key, which is an application decision.
+Ordering is not a promise of this library. Replicas sharing a queue compete for
+each message, and above `WithConcurrency(1)` the workers of a single client take
+several at a time, so two messages may be handled concurrently and finish out of
+order. Retry breaks the order on its own: a failed message waits in the retry
+queue and comes back behind everything published meanwhile, with a serial
+consumer as much as with a pool.
+
+Where order by key is what the domain needs, the recipe is one route per bucket:
+publish with `hash(key) % N` as the route, and give each replica its own queue and
+its own slice with `SubscribeRoute`, consumed with a concurrency of 1. Every
+message of one key then lands in one queue and is handled one at a time, until a
+retry puts one of them back behind the messages that followed it. It is
+deliberately static: rebalancing is a deploy, and the slice of a replica that died
+waits for it to come back instead of being handed to another consumer out of
+order.
 
 ## Testing
 

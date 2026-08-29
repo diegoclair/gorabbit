@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/diegoclair/gorabbit"
@@ -198,18 +199,39 @@ func (c *Client[E]) consumeMessages(ctx context.Context) error {
 
 	c.setup.logger.Info(ctx, "gorabbit: started consuming messages", c.connFields("queue", c.setup.queueName)...)
 
+	// Only consuming stops with the context: the connection is intact and still
+	// publishes, so no delivery may be pulled and left unacked.
+	stopCancelling := context.AfterFunc(ctx, c.cancelConsumer)
+	defer stopCancelling()
+
+	var workers sync.WaitGroup
+	for range c.setup.concurrency {
+		workers.Go(func() { c.runWorker(ctx, msgs) })
+	}
+
+	// A reconnect calls this again, so this generation of workers has to be gone
+	// before it returns: two pools on one queue would process side by side.
+	workers.Wait()
+
+	// A channel we asked to close is a shutdown, not the outage that must make
+	// the caller drop the connection and reconnect.
+	if ctx.Err() != nil || c.closed() {
+		return nil
+	}
+
+	return errors.New("gorabbit: consume channel closed unexpectedly")
+}
+
+func (c *Client[E]) runWorker(ctx context.Context, msgs <-chan amqp091.Delivery) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Only consuming stops here: the connection is intact and still
-			// publishes, so no delivery may be pulled and left unacked.
-			c.cancelConsumer()
-			return nil
+			return
 		case <-c.done:
-			return nil
+			return
 		case msg, ok := <-msgs:
 			if !ok {
-				return errors.New("gorabbit: consume channel closed unexpectedly")
+				return
 			}
 
 			if err := c.processMessage(ctx, msg); err != nil {

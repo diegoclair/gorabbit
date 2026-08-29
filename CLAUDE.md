@@ -61,6 +61,30 @@ loses the reservation skips that message and comes back to it later.
   one cache key is a configuration mistake and is refused. The guard catches the
   mistake, the lease makes the sharing between processes safe.
 
+## The consumer's two knobs
+
+Prefetch and concurrency are different things and both belong to the caller.
+`WithPrefetchCount` is the transport buffer — how many unacknowledged deliveries
+the broker pushes in advance, and therefore how many this consumer checks out of
+the queue where no other replica can reach them. `WithConcurrency` is the worker
+pool — how many deliveries are inside a handler at once. Neither is derived from
+the other: a setup that cannot work (a pool wider than a prefetch that bounds it,
+concurrency above one on a client that does not consume) is refused at
+`validate`, never rewritten behind the caller.
+
+- **The pool belongs to the client, not to a subscription.** One set of
+  goroutines reads the single delivery channel and serves every registered
+  handler. Partitioning by key is the one thing that could restore order across
+  message types sharing a key, and it needs the pool there — so a pool per
+  subscription is not an option even where it would look equivalent today.
+- **One generation of workers at a time.** `consumeMessages` runs again on every
+  reconnect and must not return while a worker it started is alive, or the
+  reconnect brings a second pool up beside the first.
+- **Order is not a guarantee this library makes.** Above a concurrency of one,
+  two messages of a queue are handled at the same time. Where order by key
+  matters the answer is a route per bucket and a concurrency of one, not a lock
+  in the consumer.
+
 ## When the test suite is enough, and when it is not
 
 The suite in `rabbitmq` runs against a real RabbitMQ through TestContainers, with

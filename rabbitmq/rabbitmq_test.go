@@ -106,6 +106,34 @@ func TestSetupValidate(t *testing.T) {
 			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithPublishConfirmTimeout(0),
 			wantErr: "publish confirm timeout must be greater than zero",
 		},
+		{
+			name:    "concurrency below one",
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithConcurrency(0),
+			wantErr: "concurrency must be greater than zero",
+		},
+		{
+			name:    "concurrency on a client that is not a consumer",
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConcurrency(2),
+			wantErr: "concurrency is only available for consumers",
+		},
+		{
+			name:    "concurrency above the prefetch count",
+			setup:   NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(2).WithConcurrency(3),
+			wantErr: "concurrency must not be greater than the prefetch count",
+		},
+		{
+			name:  "concurrency equal to the prefetch count",
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(3).WithConcurrency(3),
+		},
+		{
+			// Zero prefetch is AMQP's unlimited, so it bounds no pool.
+			name:  "concurrency above one with no prefetch count",
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithConcurrency(8),
+		},
+		{
+			name:  "serial consumer with a prefetch of one",
+			setup: NewSetup[ordersExchange](unreachableURL, "app").WithConsumer("q").WithPrefetchCount(1),
+		},
 	}
 
 	for _, tt := range tests {
@@ -127,6 +155,7 @@ func TestSetupBuilders(t *testing.T) {
 		WithConsumer("app-queue").
 		WithRetry(5, 2*time.Second, retryable).
 		WithPrefetchCount(10).
+		WithConcurrency(4).
 		WithReconnectDelay(time.Minute).
 		WithPublishConfirmTimeout(3 * time.Second)
 
@@ -139,6 +168,7 @@ func TestSetupBuilders(t *testing.T) {
 	require.Equal(t, 2*time.Second, s.retryInterval)
 	require.NotNil(t, s.retryableErrorFunc)
 	require.Equal(t, 10, s.preFetchCount)
+	require.Equal(t, 4, s.concurrency)
 	require.Equal(t, time.Minute, s.reconnectDelay)
 	require.Equal(t, 3*time.Second, s.confirmTimeout)
 }
@@ -153,6 +183,7 @@ func TestSetupOptionalDependenciesKeepDefaults(t *testing.T) {
 	require.NotNil(t, s.headers)
 	require.Equal(t, defaultReconnectDelay, s.reconnectDelay)
 	require.Equal(t, defaultPublishConfirmTimeout, s.confirmTimeout)
+	require.Equal(t, 1, s.concurrency, "a client nobody configured handles one delivery at a time")
 }
 
 func TestConnectRequiresCache(t *testing.T) {
@@ -637,6 +668,20 @@ func (l *recordingLogger) record(msg string, kv []any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.lines = append(l.lines, recordedLine{msg: msg, fields: fields})
+}
+
+func (l *recordingLogger) count(msg string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	n := 0
+	for _, line := range l.lines {
+		if line.msg == msg {
+			n++
+		}
+	}
+
+	return n
 }
 
 func (l *recordingLogger) fieldsOf(msg string) (map[string]any, bool) {

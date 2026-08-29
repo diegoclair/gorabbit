@@ -14,10 +14,8 @@ import (
 	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
-// Message ordering is not handled here: with two consumers on the same queue,
-// two published messages may be processed concurrently and out of order.
-// Ordering requires Single Active Consumer plus a partitioning key, which is an
-// application-level decision.
+// Message ordering is not a promise of this package: replicas sharing a queue
+// and the worker pool of one client both take deliveries in parallel.
 
 const (
 	defaultReconnectDelay = 2 * time.Second
@@ -53,6 +51,7 @@ type Setup[E gorabbit.Exchange] struct {
 	logger             gorabbit.Logger
 	headers            gorabbit.HeaderCarrier
 	preFetchCount      int
+	concurrency        int
 	withRetry          bool
 	retryCount         int
 	retryInterval      time.Duration
@@ -77,6 +76,7 @@ func NewSetup[E gorabbit.Exchange](amqpURL, appName string) *Setup[E] {
 		headers:        gorabbit.NoopHeaderCarrier(),
 		reconnectDelay: defaultReconnectDelay,
 		confirmTimeout: defaultPublishConfirmTimeout,
+		concurrency:    1,
 	}
 }
 
@@ -105,6 +105,13 @@ func (s *Setup[E]) WithRetry(retryCount int, retryInterval time.Duration, retrya
 // to this consumer at once.
 func (s *Setup[E]) WithPrefetchCount(count int) *Setup[E] {
 	s.preFetchCount = count
+	return s
+}
+
+// WithConcurrency sets how many deliveries this client handles at once, across
+// every handler it registered. Above 1 the order of the queue is not preserved.
+func (s *Setup[E]) WithConcurrency(n int) *Setup[E] {
+	s.concurrency = n
 	return s
 }
 
@@ -163,6 +170,14 @@ func (s *Setup[E]) validate() error {
 		return errors.New("gorabbit: retry interval must be greater than zero")
 	case s.confirmTimeout <= 0:
 		return errors.New("gorabbit: publish confirm timeout must be greater than zero")
+	case s.concurrency < 1:
+		return errors.New("gorabbit: concurrency must be greater than zero")
+	case s.concurrency > 1 && !s.isConsumer:
+		return errors.New("gorabbit: concurrency is only available for consumers")
+	// A prefetch of zero is AMQP's unlimited; anything else below the
+	// concurrency leaves workers that could never hold a delivery.
+	case s.preFetchCount > 0 && s.concurrency > s.preFetchCount:
+		return errors.New("gorabbit: concurrency must not be greater than the prefetch count")
 	}
 
 	return nil
