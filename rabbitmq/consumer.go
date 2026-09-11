@@ -276,7 +276,9 @@ func (c *Client[E]) processMessage(ctx context.Context, msg amqp091.Delivery) er
 		return msg.Nack(false, false) // no handler, no requeue
 	}
 
-	ctx = c.setup.headers.ToContext(ctx, msg.Headers)
+	// Cancelling Start stops the next delivery, never the one in a handler: a call
+	// cut mid-way by a shutdown is an answer lost, and Close already waits for it.
+	ctx = c.setup.headers.ToContext(context.WithoutCancel(ctx), msg.Headers)
 
 	if err := handlerInfo.handler(ctx, msg); err != nil {
 		if c.setup.withRetry && (c.setup.retryableErrorFunc == nil || c.setup.retryableErrorFunc(err)) {

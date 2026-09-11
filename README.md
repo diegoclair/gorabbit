@@ -300,7 +300,7 @@ first successful connection:
   instead of caching, `Connected()` stays false and the background loop keeps
   retrying until the broker (or the deploy) is fixed.
 - Cancelling the `Start` context stops consuming; the client stays connected and
-  keeps publishing until `Close`.
+  keeps publishing until `Close`. A delivery already in a handler is not cut: its handler's context does not inherit that cancellation, and `Close` waits for it.
 - After `Close`, `Publish` neither caches nor reconnects: it returns
   `rabbitmq.ErrClientClosed`.
 
