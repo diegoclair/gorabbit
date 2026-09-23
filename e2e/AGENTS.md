@@ -8,7 +8,7 @@ It exists for one reason: the integration suite runs every client inside a singl
 test binary, so anything scoped to the process — a package variable, a
 `sync.Once`, a singleton — is shared between the clients that are supposed to be
 independent. Everything else belongs in that suite, which is faster and steadier.
-The root `CLAUDE.md` says where the line is.
+The root `AGENTS.md` says where the line is.
 
 ## What is in here
 
